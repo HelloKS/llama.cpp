@@ -55,7 +55,7 @@ void llama_model_glm4_moe::load_arch_tensors(llama_model_loader &) {
         int flags = 0;
         if (i >= n_layer) {
             // skip all tensors in the NextN layers
-            flags |= TENSOR_SKIP;
+            flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
         }
 
         auto & layer = layers[i];

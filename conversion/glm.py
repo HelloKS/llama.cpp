@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterable, TYPE_CHECKING
+import re
+from typing import Callable, Iterable, TYPE_CHECKING
 
 import torch
 
@@ -91,28 +92,59 @@ class GlmOCRModel(Glm4Model):
 
     # Note: GLM-OCR is the same as GLM4, but with an extra NextN/MTP prediction layer
 
+    _n_main_layers: int | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # GLM-OCR has num_hidden_layers + 1 actual layers (including NextN layer)
-        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
-        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        if not self.no_mtp:
+            self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        type(self)._n_main_layers = self.hparams.get("num_hidden_layers")
+        return super().index_tensors(remote_hf_model_id)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         # NextN/MTP prediction layers
-        if (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+        if not self.no_mtp and (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        if (titem := super().filter_tensors(item)) is None:
+            return None
+        name, gen = titem
+
+        if cls._n_main_layers is not None:
+            is_mtp = (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None and int(m.group(1)) >= cls._n_main_layers
+            if is_mtp and cls.no_mtp:
+                return None
+            if cls.mtp_only and not is_mtp and name not in (
+                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+            ):
+                return None
+
+        return name, gen
 
 
 @ModelBase.register("Glm4MoeForCausalLM", "Glm4vMoeForConditionalGeneration")
 class Glm4MoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.GLM4_MOE
 
+    _n_main_layers: int | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # GLM4_MOE has num_hidden_layers + 1 actual layers (including NextN layer)
-        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
-        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        if not self.no_mtp:
+            self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        type(self)._n_main_layers = self.hparams.get("num_hidden_layers")
+        return super().index_tensors(remote_hf_model_id)
 
     def set_vocab(self):
         return self._set_vocab_glm()
@@ -149,7 +181,7 @@ class Glm4MoeModel(TextModel):
             self.gguf_writer.add_expert_weights_norm(norm_topk_prob)
 
         # NextN/MTP prediction layers
-        if (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+        if not self.no_mtp and (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
 
     _experts: list[dict[str, Tensor]] | None = None
@@ -200,6 +232,23 @@ class Glm4MoeModel(TextModel):
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
 
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        if (titem := super().filter_tensors(item)) is None:
+            return None
+        name, gen = titem
+
+        if cls._n_main_layers is not None:
+            is_mtp = (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None and int(m.group(1)) >= cls._n_main_layers
+            if is_mtp and cls.no_mtp:
+                return None
+            if cls.mtp_only and not is_mtp and name not in (
+                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+            ):
+                return None
+
+        return name, gen
+
 
 @ModelBase.register("Glm4MoeLiteForCausalLM")
 class Glm4MoeLiteModel(DeepseekV2Model):
@@ -214,10 +263,17 @@ class GlmMoeDsaModel(DeepseekV2Model):
     model_arch = gguf.MODEL_ARCH.GLM_DSA
     skip_mtp = False
 
+    _n_main_layers: int | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
-        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        if not self.no_mtp:
+            self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        type(self)._n_main_layers = self.hparams.get("num_hidden_layers")
+        return super().index_tensors(remote_hf_model_id)
 
     def set_vocab(self):
         return self._set_vocab_glm()
@@ -230,13 +286,30 @@ class GlmMoeDsaModel(DeepseekV2Model):
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * partial_rotary_factor))
 
         # NextN/MTP prediction layers
-        if (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+        if not self.no_mtp and (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
 
         # DSA indexer parameters
         self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        if (titem := super().filter_tensors(item)) is None:
+            return None
+        name, gen = titem
+
+        if cls._n_main_layers is not None:
+            is_mtp = (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None and int(m.group(1)) >= cls._n_main_layers
+            if is_mtp and cls.no_mtp:
+                return None
+            if cls.mtp_only and not is_mtp and name not in (
+                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+            ):
+                return None
+
+        return name, gen
 
 
 @ModelBase.register("SolarOpenForCausalLM")
