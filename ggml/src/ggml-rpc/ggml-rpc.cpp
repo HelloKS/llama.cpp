@@ -18,6 +18,11 @@
 #include <filesystem>
 #include <algorithm>
 
+#ifdef GGML_USE_NCCL
+#include <nccl.h>
+#include <cuda_runtime.h>
+#endif
+
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 #define LOG_DBG(...) \
@@ -71,6 +76,12 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+#ifdef GGML_USE_NCCL
+    RPC_CMD_NCCL_GET_UNIQUE_ID,
+    RPC_CMD_NCCL_INIT,
+    RPC_CMD_NCCL_ALLREDUCE,
+    RPC_CMD_NCCL_DESTROY,
+#endif
     RPC_CMD_COUNT,
 };
 
@@ -189,6 +200,28 @@ struct rpc_msg_get_device_memory_rsp {
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
 };
+
+#ifdef GGML_USE_NCCL
+struct rpc_msg_nccl_unique_id_rsp {
+    uint8_t unique_id[128];
+};
+
+struct rpc_msg_nccl_init_req {
+    uint8_t  unique_id[128];
+    uint32_t rank;
+    uint32_t nranks;
+};
+
+struct rpc_msg_nccl_allreduce_req {
+    rpc_tensor tensor;
+    uint32_t   nccl_type;
+    uint32_t   device;
+};
+
+struct rpc_msg_nccl_destroy_req {
+    uint32_t device;
+};
+#endif
 
 #pragma pack(pop)
 
@@ -841,6 +874,13 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
 
+#ifdef GGML_USE_NCCL
+    bool nccl_get_unique_id(rpc_msg_nccl_unique_id_rsp & response);
+    bool nccl_init(const rpc_msg_nccl_init_req & request);
+    bool nccl_allreduce(const rpc_msg_nccl_allreduce_req & request);
+    void nccl_destroy();
+#endif
+
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -860,6 +900,11 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+
+#ifdef GGML_USE_NCCL
+    ncclComm_t  nccl_comm   = nullptr;
+    cudaStream_t nccl_stream = nullptr;
+#endif
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1419,7 +1464,104 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+#ifdef GGML_USE_NCCL
+bool rpc_server::nccl_get_unique_id(rpc_msg_nccl_unique_id_rsp & response) {
+    ncclUniqueId id;
+    ncclResult_t rc = ncclGetUniqueId(&id);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("[%s] ncclGetUniqueId failed: %s\n", __func__, ncclGetErrorString(rc));
+        return false;
+    }
+    static_assert(sizeof(id) == sizeof(response.unique_id), "ncclUniqueId size mismatch");
+    memcpy(response.unique_id, &id, sizeof(id));
+    return true;
+}
+
+bool rpc_server::nccl_init(const rpc_msg_nccl_init_req & request) {
+    ncclUniqueId id;
+    memcpy(&id, request.unique_id, sizeof(id));
+
+    int dev = 0;
+    cudaError_t cuda_rc = cudaSetDevice(dev);
+    if (cuda_rc != cudaSuccess) {
+        GGML_LOG_ERROR("[%s] cudaSetDevice(%d) failed: %s\n", __func__, dev, cudaGetErrorString(cuda_rc));
+        return false;
+    }
+
+    if (nccl_stream == nullptr) {
+        cuda_rc = cudaStreamCreateWithFlags(&nccl_stream, cudaStreamNonBlocking);
+        if (cuda_rc != cudaSuccess) {
+            GGML_LOG_ERROR("[%s] cudaStreamCreate failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
+            return false;
+        }
+    }
+
+    ncclResult_t rc = ncclCommInitRank(&nccl_comm, request.nranks, id, request.rank);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("[%s] ncclCommInitRank(rank=%u, nranks=%u) failed: %s\n",
+                       __func__, request.rank, request.nranks, ncclGetErrorString(rc));
+        return false;
+    }
+
+    LOG_DBG("[%s] NCCL comm initialized: rank=%u nranks=%u\n", __func__, request.rank, request.nranks);
+    return true;
+}
+
+bool rpc_server::nccl_allreduce(const rpc_msg_nccl_allreduce_req & request) {
+    if (nccl_comm == nullptr) {
+        GGML_LOG_ERROR("[%s] NCCL comm not initialized\n", __func__);
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || tensor->data == nullptr) {
+        GGML_LOG_ERROR("[%s] failed to deserialize tensor\n", __func__);
+        return false;
+    }
+
+    size_t count = ggml_nelements(tensor);
+    ncclDataType_t dtype = (ncclDataType_t)request.nccl_type;
+    ncclResult_t rc = ncclAllReduce(tensor->data, tensor->data, count,
+                                     dtype, ncclSum, nccl_comm, nccl_stream);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("[%s] ncclAllReduce failed: %s\n", __func__, ncclGetErrorString(rc));
+        return false;
+    }
+
+    cudaError_t cuda_rc = cudaStreamSynchronize(nccl_stream);
+    if (cuda_rc != cudaSuccess) {
+        GGML_LOG_ERROR("[%s] cudaStreamSynchronize failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
+        return false;
+    }
+
+    return true;
+}
+
+void rpc_server::nccl_destroy() {
+    if (nccl_comm != nullptr) {
+        ncclCommDestroy(nccl_comm);
+        nccl_comm = nullptr;
+    }
+    if (nccl_stream != nullptr) {
+        cudaStreamDestroy(nccl_stream);
+        nccl_stream = nullptr;
+    }
+}
+#endif
+
 rpc_server::~rpc_server() {
+#ifdef GGML_USE_NCCL
+    nccl_destroy();
+#endif
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -1684,6 +1826,49 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+#ifdef GGML_USE_NCCL
+            case RPC_CMD_NCCL_GET_UNIQUE_ID: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                rpc_msg_nccl_unique_id_rsp response;
+                if (!server.nccl_get_unique_id(response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_NCCL_INIT: {
+                rpc_msg_nccl_init_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.nccl_init(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_NCCL_ALLREDUCE: {
+                rpc_msg_nccl_allreduce_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.nccl_allreduce(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_NCCL_DESTROY: {
+                rpc_msg_nccl_destroy_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                server.nccl_destroy();
+                break;
+            }
+#endif
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -1880,6 +2065,166 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
     }
 }
 
+#ifdef GGML_USE_NCCL
+struct rpc_nccl_comm_context {
+    std::vector<ggml_backend_t> backends;
+    int local_rank;
+    int remote_rank;
+
+    ncclComm_t  local_comm;
+    cudaStream_t local_nccl_stream;
+
+    std::shared_ptr<socket_t> remote_sock;
+};
+
+static ncclDataType_t ggml_type_to_nccl(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:  return ncclFloat32;
+        case GGML_TYPE_F16:  return ncclFloat16;
+        case GGML_TYPE_BF16: return ncclBfloat16;
+        default:             return ncclFloat32;
+    }
+}
+
+static void * rpc_nccl_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    if (n_backends != 2) {
+        LOG_DBG("[%s] only 2 backends supported, got %zu\n", __func__, n_backends);
+        return nullptr;
+    }
+
+    int local_idx = -1, remote_idx = -1;
+    for (size_t i = 0; i < n_backends; i++) {
+        if (ggml_backend_is_rpc(backends[i])) {
+            remote_idx = (int)i;
+        } else {
+            local_idx = (int)i;
+        }
+    }
+    if (local_idx < 0 || remote_idx < 0) {
+        LOG_DBG("[%s] need exactly 1 CUDA + 1 RPC backend\n", __func__);
+        return nullptr;
+    }
+
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backends[remote_idx]->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        GGML_LOG_ERROR("[%s] failed to connect to remote server\n", __func__);
+        return nullptr;
+    }
+
+    rpc_msg_nccl_unique_id_rsp id_response;
+    bool ok = send_rpc_cmd(sock, RPC_CMD_NCCL_GET_UNIQUE_ID, nullptr, 0,
+                           &id_response, sizeof(id_response));
+    if (!ok) {
+        GGML_LOG_ERROR("[%s] failed to get NCCL unique ID from remote\n", __func__);
+        return nullptr;
+    }
+
+    ncclUniqueId unique_id;
+    memcpy(&unique_id, id_response.unique_id, sizeof(unique_id));
+
+    const int nranks = 2;
+    const int local_rank = 0;
+    const int remote_rank = 1;
+
+    rpc_msg_nccl_init_req init_req;
+    memcpy(init_req.unique_id, &unique_id, sizeof(unique_id));
+    init_req.rank = (uint32_t)remote_rank;
+    init_req.nranks = (uint32_t)nranks;
+
+    ok = send_rpc_cmd(sock, RPC_CMD_NCCL_INIT, &init_req, sizeof(init_req));
+    if (!ok) {
+        GGML_LOG_ERROR("[%s] failed to send NCCL_INIT to remote\n", __func__);
+        return nullptr;
+    }
+
+    cudaSetDevice(0);
+    ncclComm_t local_comm = nullptr;
+    ncclResult_t rc = ncclCommInitRank(&local_comm, nranks, unique_id, local_rank);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("[%s] local ncclCommInitRank failed: %s\n", __func__, ncclGetErrorString(rc));
+        return nullptr;
+    }
+
+    cudaStream_t local_nccl_stream;
+    cudaError_t cuda_rc = cudaStreamCreateWithFlags(&local_nccl_stream, cudaStreamNonBlocking);
+    if (cuda_rc != cudaSuccess) {
+        GGML_LOG_ERROR("[%s] cudaStreamCreate failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
+        ncclCommDestroy(local_comm);
+        return nullptr;
+    }
+
+    auto * ctx = new rpc_nccl_comm_context();
+    ctx->backends.assign(backends, backends + n_backends);
+    ctx->local_rank = local_idx;
+    ctx->remote_rank = remote_idx;
+    ctx->local_comm = local_comm;
+    ctx->local_nccl_stream = local_nccl_stream;
+    ctx->remote_sock = sock;
+
+    LOG_DBG("[%s] NCCL comm initialized: local_rank=%d remote_rank=%d nranks=%d\n",
+            __func__, local_idx, remote_idx, nranks);
+    return ctx;
+}
+
+static bool rpc_nccl_comm_allreduce(void * comm_ctx, struct ggml_tensor ** tensors) {
+    auto * ctx = (rpc_nccl_comm_context *)comm_ctx;
+    const int li = ctx->local_rank;
+    const int ri = ctx->remote_rank;
+
+    ggml_tensor * local_tensor  = tensors[li];
+    ggml_tensor * remote_tensor = tensors[ri];
+
+    size_t count = ggml_nelements(local_tensor);
+    ncclDataType_t dtype = ggml_type_to_nccl(local_tensor->type);
+
+    rpc_msg_nccl_allreduce_req req;
+    req.tensor = serialize_tensor(remote_tensor);
+    req.nccl_type = (uint32_t)dtype;
+    req.device = 0;
+
+    bool remote_ok = send_rpc_cmd(ctx->remote_sock, RPC_CMD_NCCL_ALLREDUCE,
+                                   &req, sizeof(req));
+    if (!remote_ok) {
+        GGML_LOG_ERROR("[%s] failed to send NCCL_ALLREDUCE to remote\n", __func__);
+        return false;
+    }
+
+    ncclResult_t rc = ncclAllReduce(local_tensor->data, local_tensor->data,
+                                     count, dtype, ncclSum,
+                                     ctx->local_comm, ctx->local_nccl_stream);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("[%s] local ncclAllReduce failed: %s\n", __func__, ncclGetErrorString(rc));
+        return false;
+    }
+
+    cudaError_t cuda_rc = cudaStreamSynchronize(ctx->local_nccl_stream);
+    if (cuda_rc != cudaSuccess) {
+        GGML_LOG_ERROR("[%s] cudaStreamSynchronize failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
+        return false;
+    }
+
+    return true;
+}
+
+static void rpc_nccl_comm_free(void * comm_ctx) {
+    auto * ctx = (rpc_nccl_comm_context *)comm_ctx;
+
+    rpc_msg_nccl_destroy_req destroy_req;
+    destroy_req.device = 0;
+    send_rpc_cmd(ctx->remote_sock, RPC_CMD_NCCL_DESTROY, &destroy_req, sizeof(destroy_req));
+
+    if (ctx->local_comm != nullptr) {
+        ncclCommDestroy(ctx->local_comm);
+    }
+    if (ctx->local_nccl_stream != nullptr) {
+        cudaStreamDestroy(ctx->local_nccl_stream);
+    }
+
+    delete ctx;
+}
+#endif
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
@@ -1887,6 +2232,17 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+#ifdef GGML_USE_NCCL
+    if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *)rpc_nccl_comm_init;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *)rpc_nccl_comm_free;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *)rpc_nccl_comm_allreduce;
+    }
+#endif
     return NULL;
 
     GGML_UNUSED(reg);
