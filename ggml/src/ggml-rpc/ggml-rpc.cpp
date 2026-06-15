@@ -21,6 +21,7 @@
 #ifdef GGML_USE_NCCL
 #include <nccl.h>
 #include <cuda_runtime.h>
+#include "ggml-cuda.h"
 #endif
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -902,8 +903,10 @@ private:
     std::vector<stored_graph> stored_graphs;
 
 #ifdef GGML_USE_NCCL
-    ncclComm_t  nccl_comm   = nullptr;
+    ncclComm_t   nccl_comm   = nullptr;
     cudaStream_t nccl_stream = nullptr;
+    cudaEvent_t  pre_event   = nullptr;
+    cudaEvent_t  post_event  = nullptr;
 #endif
 };
 
@@ -1496,6 +1499,21 @@ bool rpc_server::nccl_init(const rpc_msg_nccl_init_req & request) {
         }
     }
 
+    if (pre_event == nullptr) {
+        cuda_rc = cudaEventCreateWithFlags(&pre_event, cudaEventDisableTiming);
+        if (cuda_rc != cudaSuccess) {
+            GGML_LOG_ERROR("[%s] cudaEventCreate(pre) failed\n", __func__);
+            return false;
+        }
+    }
+    if (post_event == nullptr) {
+        cuda_rc = cudaEventCreateWithFlags(&post_event, cudaEventDisableTiming);
+        if (cuda_rc != cudaSuccess) {
+            GGML_LOG_ERROR("[%s] cudaEventCreate(post) failed\n", __func__);
+            return false;
+        }
+    }
+
     ncclResult_t rc = ncclCommInitRank(&nccl_comm, request.nranks, id, request.rank);
     if (rc != ncclSuccess) {
         GGML_LOG_ERROR("[%s] ncclCommInitRank(rank=%u, nranks=%u) failed: %s\n",
@@ -1528,11 +1546,18 @@ bool rpc_server::nccl_allreduce(const rpc_msg_nccl_allreduce_req & request) {
         return false;
     }
 
+    cudaStream_t compute_stream = (cudaStream_t)ggml_backend_cuda_get_stream(
+        backends[request.device]);
+    if (compute_stream == nullptr) {
+        GGML_LOG_ERROR("[%s] failed to get CUDA compute stream\n", __func__);
+        return false;
+    }
+
+    cudaEventRecord(pre_event, compute_stream);
+    cudaStreamWaitEvent(nccl_stream, pre_event);
+
     size_t count = ggml_nelements(tensor);
     ncclDataType_t dtype = (ncclDataType_t)request.nccl_type;
-
-    cudaDeviceSynchronize();
-
     ncclResult_t rc = ncclAllReduce(tensor->data, tensor->data, count,
                                      dtype, ncclSum, nccl_comm, nccl_stream);
     if (rc != ncclSuccess) {
@@ -1540,11 +1565,8 @@ bool rpc_server::nccl_allreduce(const rpc_msg_nccl_allreduce_req & request) {
         return false;
     }
 
-    cudaError_t cuda_rc = cudaStreamSynchronize(nccl_stream);
-    if (cuda_rc != cudaSuccess) {
-        GGML_LOG_ERROR("[%s] cudaStreamSynchronize failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
-        return false;
-    }
+    cudaEventRecord(post_event, nccl_stream);
+    cudaStreamWaitEvent(compute_stream, post_event);
 
     return true;
 }
@@ -1553,6 +1575,14 @@ void rpc_server::nccl_destroy() {
     if (nccl_comm != nullptr) {
         ncclCommDestroy(nccl_comm);
         nccl_comm = nullptr;
+    }
+    if (pre_event != nullptr) {
+        cudaEventDestroy(pre_event);
+        pre_event = nullptr;
+    }
+    if (post_event != nullptr) {
+        cudaEventDestroy(post_event);
+        post_event = nullptr;
     }
     if (nccl_stream != nullptr) {
         cudaStreamDestroy(nccl_stream);
@@ -2074,8 +2104,10 @@ struct rpc_nccl_comm_context {
     int local_rank;
     int remote_rank;
 
-    ncclComm_t  local_comm;
+    ncclComm_t   local_comm;
     cudaStream_t local_nccl_stream;
+    cudaEvent_t  pre_event;
+    cudaEvent_t  post_event;
 
     std::shared_ptr<socket_t> remote_sock;
 };
@@ -2141,7 +2173,8 @@ static void * rpc_nccl_comm_init(ggml_backend_t * backends, size_t n_backends) {
         return nullptr;
     }
 
-    cudaSetDevice(0);
+    int dev = ggml_backend_cuda_get_device(backends[local_idx]);
+    cudaSetDevice(dev);
     ncclComm_t local_comm = nullptr;
     ncclResult_t rc = ncclCommInitRank(&local_comm, nranks, unique_id, local_rank);
     if (rc != ncclSuccess) {
@@ -2157,12 +2190,31 @@ static void * rpc_nccl_comm_init(ggml_backend_t * backends, size_t n_backends) {
         return nullptr;
     }
 
+    cudaEvent_t pre_event, post_event;
+    cuda_rc = cudaEventCreateWithFlags(&pre_event, cudaEventDisableTiming);
+    if (cuda_rc != cudaSuccess) {
+        GGML_LOG_ERROR("[%s] cudaEventCreate(pre) failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
+        cudaStreamDestroy(local_nccl_stream);
+        ncclCommDestroy(local_comm);
+        return nullptr;
+    }
+    cuda_rc = cudaEventCreateWithFlags(&post_event, cudaEventDisableTiming);
+    if (cuda_rc != cudaSuccess) {
+        GGML_LOG_ERROR("[%s] cudaEventCreate(post) failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
+        cudaEventDestroy(pre_event);
+        cudaStreamDestroy(local_nccl_stream);
+        ncclCommDestroy(local_comm);
+        return nullptr;
+    }
+
     auto * ctx = new rpc_nccl_comm_context();
     ctx->backends.assign(backends, backends + n_backends);
     ctx->local_rank = local_idx;
     ctx->remote_rank = remote_idx;
     ctx->local_comm = local_comm;
     ctx->local_nccl_stream = local_nccl_stream;
+    ctx->pre_event = pre_event;
+    ctx->post_event = post_event;
     ctx->remote_sock = sock;
 
     LOG_DBG("[%s] NCCL comm initialized: local_rank=%d remote_rank=%d nranks=%d\n",
@@ -2193,7 +2245,15 @@ static bool rpc_nccl_comm_allreduce(void * comm_ctx, struct ggml_tensor ** tenso
         return false;
     }
 
-    cudaDeviceSynchronize();
+    cudaStream_t compute_stream = (cudaStream_t)ggml_backend_cuda_get_stream(
+        ctx->backends[li]);
+    if (compute_stream == nullptr) {
+        GGML_LOG_ERROR("[%s] failed to get CUDA compute stream\n", __func__);
+        return false;
+    }
+
+    cudaEventRecord(ctx->pre_event, compute_stream);
+    cudaStreamWaitEvent(ctx->local_nccl_stream, ctx->pre_event);
 
     ncclResult_t rc = ncclAllReduce(local_tensor->data, local_tensor->data,
                                      count, dtype, ncclSum,
@@ -2203,11 +2263,8 @@ static bool rpc_nccl_comm_allreduce(void * comm_ctx, struct ggml_tensor ** tenso
         return false;
     }
 
-    cudaError_t cuda_rc = cudaStreamSynchronize(ctx->local_nccl_stream);
-    if (cuda_rc != cudaSuccess) {
-        GGML_LOG_ERROR("[%s] cudaStreamSynchronize failed: %s\n", __func__, cudaGetErrorString(cuda_rc));
-        return false;
-    }
+    cudaEventRecord(ctx->post_event, ctx->local_nccl_stream);
+    cudaStreamWaitEvent(compute_stream, ctx->post_event);
 
     return true;
 }
@@ -2221,6 +2278,12 @@ static void rpc_nccl_comm_free(void * comm_ctx) {
 
     if (ctx->local_comm != nullptr) {
         ncclCommDestroy(ctx->local_comm);
+    }
+    if (ctx->pre_event != nullptr) {
+        cudaEventDestroy(ctx->pre_event);
+    }
+    if (ctx->post_event != nullptr) {
+        cudaEventDestroy(ctx->post_event);
     }
     if (ctx->local_nccl_stream != nullptr) {
         cudaStreamDestroy(ctx->local_nccl_stream);
