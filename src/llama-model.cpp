@@ -407,11 +407,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             rotation = hparams.n_layer() % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
-        if (tensor_axis_0 == nullptr) {
-            GGML_ASSERT(!suffix_fallback.empty());
+        if (tensor_axis_0 == nullptr && !suffix_fallback.empty()) {
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
-        GGML_ASSERT(tensor_axis_0 != nullptr);
+        if (tensor_axis_0 == nullptr) {
+            LLAMA_LOG_WARN("%s: could not find reference tensor for '%s' (suffix='%s', fallback='%s'), using MIRRORED split\n",
+                           __func__, tensor_name.c_str(), suffix.c_str(), suffix_fallback.c_str());
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, il, rotation};
+        }
         return {axis, tensor_axis_0, il, rotation};
     };
 
