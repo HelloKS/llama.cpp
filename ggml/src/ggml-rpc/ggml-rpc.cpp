@@ -1530,6 +1530,9 @@ bool rpc_server::nccl_allreduce(const rpc_msg_nccl_allreduce_req & request) {
 
     size_t count = ggml_nelements(tensor);
     ncclDataType_t dtype = (ncclDataType_t)request.nccl_type;
+
+    cudaDeviceSynchronize();
+
     ncclResult_t rc = ncclAllReduce(tensor->data, tensor->data, count,
                                      dtype, ncclSum, nccl_comm, nccl_stream);
     if (rc != ncclSuccess) {
@@ -2189,6 +2192,8 @@ static bool rpc_nccl_comm_allreduce(void * comm_ctx, struct ggml_tensor ** tenso
         GGML_LOG_ERROR("[%s] failed to send NCCL_ALLREDUCE to remote\n", __func__);
         return false;
     }
+
+    cudaDeviceSynchronize();
 
     ncclResult_t rc = ncclAllReduce(local_tensor->data, local_tensor->data,
                                      count, dtype, ncclSum,
