@@ -25,8 +25,17 @@ void llama_model_mimo2::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_mimo2::load_arch_tensors(llama_model_loader &) {
+void llama_model_mimo2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    // Trunk-only: the GGUF declares MTP layers in metadata but the actual MTP
+    // tensors live in a separate file (e.g. user split target/draft). Mark
+    // MTP tensors NOT_REQUIRED so the trunk loads cleanly.
+    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
+    const bool trunk_only = (hparams.n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
+    const int trunk_flags = mtp_only   ? TENSOR_NOT_REQUIRED : 0;
+    const int mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -34,47 +43,57 @@ void llama_model_mimo2::load_arch_tensors(llama_model_loader &) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    for (int i = 0; i < n_layer_all; ++i) {
+    auto load_block = [&](int i, int flags) {
         auto & layer = layers[i];
         uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i);
         uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i);
-        uint32_t n_head = hparams.n_head(i);
+        uint32_t n_head_l = hparams.n_head(i);
 
-        // NextN/MTP layers (the last n_nextn blocks) are preserved but disabled pending support
-        const bool is_nextn = i >= n_layer;
-        const int  skip     = is_nextn ? TENSOR_SKIP : 0;
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa, n_embd_v_gqa, flags);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_v * n_head_l, n_embd }, flags);
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, skip);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_v * n_head, n_embd }, skip);
+        layer.attn_norm  = create_tensor(tn(LLM_TENSOR_ATTN_NORM,  "weight", i), {n_embd}, flags);
+        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head_l}, TENSOR_NOT_REQUIRED | flags);
 
-        layer.attn_norm  = create_tensor(tn(LLM_TENSOR_ATTN_NORM,  "weight", i), {n_embd}, skip);
-        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, TENSOR_NOT_REQUIRED | skip);
+        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
-        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, skip);
+        // dense FFN (also used by the MTP blocks, which are dense)
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED | flags);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, TENSOR_NOT_REQUIRED | flags);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED | flags);
 
-        // non-MoE branch
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED | skip);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, TENSOR_NOT_REQUIRED | skip);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED | skip);
-
-        // MoE branch
+        // MoE routed experts (trunk only; MTP blocks are dense)
         int64_t n_ff_exp = hparams.n_ff_exp;
-        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED | skip);
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED | skip);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED | skip);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED | skip);
-        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED | skip);
+        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED | flags);
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED | flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED | flags);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED | flags);
+        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED | flags);
+    };
 
-        if (is_nextn) {
-            layer.nextn.eh_proj  = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {2 * n_embd, n_embd}, skip);
-            layer.nextn.enorm    = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", i), {n_embd}, skip);
-            layer.nextn.hnorm    = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", i), {n_embd}, skip);
-            layer.layer_out_norm = create_tensor(tn(LLM_TENSOR_LAYER_OUT_NORM, "weight", i), {n_embd}, skip);
-        }
+    for (int i = 0; i < n_layer; ++i) {
+        load_block(i, trunk_flags);
+    }
+
+    // NextN/MTP block(s): a full mimo2 decoder block plus the NextN projections.
+    // MiMo MTP shares the trunk's token embeddings and LM head, so (unlike hy_v3)
+    // there is no nextn.embed_tokens / shared_head_head / shared_head_norm here.
+    for (int i = n_layer; i < n_layer_all; ++i) {
+        auto & layer = layers[i];
+
+        load_block(i, mtp_flags);
+
+        layer.nextn.eh_proj  = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {2 * n_embd, n_embd}, mtp_flags);
+        layer.nextn.enorm    = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", i), {n_embd}, mtp_flags);
+        layer.nextn.hnorm    = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", i), {n_embd}, mtp_flags);
+        layer.layer_out_norm = create_tensor(tn(LLM_TENSOR_LAYER_OUT_NORM, "weight", i), {n_embd}, mtp_flags);
     }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_mimo2::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -168,7 +187,7 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
             }
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -222,6 +241,15 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
 
+    // Post-final-norm hidden state: feeds the MTP draft head's hnorm. The MTP
+    // layer returns final_layernorm(h) so the chained state is post-norm.
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
@@ -231,5 +259,182 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
+    ggml_build_forward_expand(gf, cur);
+}
+
+// LLM_GRAPH_TYPE_DECODER_MTP draft head for MiMo-V2 (MoE trunk, dense MTP).
+// Mirrors vLLM's MiMoV2MTPLayer (mimo_v2_mtp.py): a single mimo2 decoder
+// block (dense MLP, SWA attention with attn_sinks + value_scale) prefixed by
+// enorm/hnorm/eh_proj and suffixed by final_layernorm (stored as
+// layer_out_norm). Shares the trunk's token embeddings and LM head.
+llama_model_mimo2::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "MIMO2 MTP requires n_layer_nextn > 0");
+
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
+                cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
+                "nextn_layer_offset out of range [0, n_layer_nextn)");
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
+    GGML_ASSERT(layer.layer_out_norm && "MTP block missing layer_out_norm (final_layernorm)");
+
+    const uint32_t n_head_l    = hparams.n_head(il);
+    const uint32_t n_head_kv_l = hparams.n_head_kv(il);
+    const float freq_base_l    = model.get_rope_freq_base(cparams, il);
+    const float freq_scale_l   = model.get_rope_freq_scale(cparams, il);
+    const float v_scale        = hparams.f_attn_value_scale;
+
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    ggml_set_name(inp->embd, "mtp_h_input");
+
+    // MiMo MTP shares the trunk's token embeddings (no nextn.embed_tokens).
+    ggml_tensor * h_input  = inp->embd;
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    auto * inp_attn           = build_attn_inp_kv_iswa();
+
+    ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    // concat[e_norm, h_norm] along the feature dim (dim 0 is feature for [n_embd, n_tokens])
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    // self_attention (mirrors the trunk: fused qkv split with v_head_dim, attn_sinks, value_scale)
+    {
+        cur = build_norm(inpSA, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+        cb(cur, "mtp_attn_norm", il);
+
+        ggml_tensor * Qcur;
+        ggml_tensor * Kcur;
+        ggml_tensor * Vcur;
+
+        if (layer.wqkv) {
+            ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur);
+            cb(qkv, "mtp_wqkv", il);
+
+            const size_t row_k    = ggml_row_size(qkv->type, n_embd_head_k);
+            const size_t row_v    = ggml_row_size(qkv->type, n_embd_head_v);
+            const size_t row_full = qkv->nb[1];
+            const size_t k_off    = row_k * n_head_l;
+            const size_t v_off    = k_off + row_k * n_head_kv_l;
+
+            Qcur = ggml_view_3d(ctx0, qkv, n_embd_head_k, n_head_l,    n_tokens, row_k, row_full, 0);
+            Kcur = ggml_view_3d(ctx0, qkv, n_embd_head_k, n_head_kv_l, n_tokens, row_k, row_full, k_off);
+            Vcur = ggml_view_3d(ctx0, qkv, n_embd_head_v, n_head_kv_l, n_tokens, row_v, row_full, v_off);
+        } else {
+            Qcur = build_lora_mm(layer.wq, cur);
+            cb(Qcur, "mtp_Qcur", il);
+
+            Kcur = build_lora_mm(layer.wk, cur);
+            cb(Kcur, "mtp_Kcur", il);
+
+            Vcur = build_lora_mm(layer.wv, cur);
+            cb(Vcur, "mtp_Vcur", il);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_k, n_head_l,    n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_k, n_head_kv_l, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv_l, n_tokens);
+        }
+
+        Qcur = ggml_rope_ext(
+            ctx0, Qcur, inp_pos, nullptr,
+            n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_ext(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+        cb(Qcur, "mtp_Qcur", il);
+        cb(Kcur, "mtp_Kcur", il);
+        cb(Vcur, "mtp_Vcur", il);
+
+        ggml_tensor * sinks = layer.attn_sinks;
+
+        cur = build_attn(inp_attn,
+                layer.wo, NULL, layer.wo_s,
+                Qcur, Kcur, Vcur, nullptr, sinks, nullptr,
+                1.0f / sqrtf(float(n_embd_head_k)), il);
+        cb(cur, "mtp_attn_out", il);
+
+        if (v_scale) {
+            cur = ggml_scale(ctx0, cur, v_scale);
+            cb(cur, "mtp_attn_out_scaled", il);
+        }
+    }
+
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cb(ffn_inp, "mtp_ffn_inp", il);
+
+    cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    // MTP blocks are dense; keep the MoE branch for symmetry with the trunk.
+    if (layer.ffn_gate_inp == nullptr) {
+        cur = build_ffn(cur,
+                layer.ffn_up,   layer.ffn_up_b,   NULL,
+                layer.ffn_gate, layer.ffn_gate_b, NULL,
+                layer.ffn_down, layer.ffn_down_b, NULL,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, "mtp_ffn_out", il);
+    } else {
+        cur = build_moe_ffn(cur,
+                layer.ffn_gate_inp,
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_exp_probs_b,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
+                il);
+        cb(cur, "mtp_ffn_moe_out", il);
+    }
+
+    cur = ggml_add(ctx0, cur, ffn_inp);
+    cb(cur, "mtp_post_ffn", il);
+
+    // final_layernorm (stored as layer_out_norm) before the shared LM head.
+    // The post-norm hidden state seeds the next MTP step (matches vLLM, where
+    // MiMoV2MTPLayer returns final_layernorm(h)).
+    cur = build_norm(cur, layer.layer_out_norm, nullptr, LLM_NORM_RMS, -1);
+
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    cb(cur, "mtp_final_norm", -1);
+
+    // shared LM head (the trunk's output; MiMo MTP has no separate head)
+    cur = build_lora_mm(model.output, cur, model.output_s);
+    cb(cur, "result_output", -1);
+
+    res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
 }
