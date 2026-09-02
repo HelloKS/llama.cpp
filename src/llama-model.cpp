@@ -393,6 +393,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
+    static const std::regex pattern_ssm_d           ("blk\\.\\d*\\.ssm_d");
+    static const std::regex pattern_ssm_in          ("blk\\.\\d*\\.ssm_in.weight");
+    static const std::regex pattern_ssm_norm        ("blk\\.\\d*\\.ssm_norm.weight");
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
     static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
@@ -400,6 +403,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
+    static const std::regex pattern_ssm_conv1d_bias ("blk\\.\\d*\\.ssm_conv1d.bias");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
@@ -469,6 +473,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        const bool is_nemotron_h = ud->model->arch == LLM_ARCH_NEMOTRON_H || ud->model->arch == LLM_ARCH_NEMOTRON_H_MOE;
+
+        if (is_nemotron_h) {
+            if (std::regex_match(tensor_name, pattern_ssm_in) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_a) || std::regex_match(tensor_name, pattern_ssm_d) ||
+                    std::regex_match(tensor_name, pattern_ssm_norm)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+            }
+        }
+
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -593,6 +612,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        const bool is_nemotron_h = ud->model->arch == LLM_ARCH_NEMOTRON_H || ud->model->arch == LLM_ARCH_NEMOTRON_H_MOE;
+        if (is_nemotron_h && hparams.is_recr(il)) {
+            const int64_t d_inner = hparams.ssm_d_inner;
+            const int64_t d_state = hparams.ssm_d_state;
+            const int64_t n_group = hparams.ssm_n_group;
+            const int64_t n_head  = hparams.ssm_dt_rank;
+
+            if (std::regex_match(tensor_name, pattern_ssm_in)) {
+                GGML_ASSERT(tensor->ne[axis] == 2*d_inner + 2*n_group*d_state + n_head);
+                return {{d_inner, 2}, {n_group*d_state, 2}, {n_head, 1}};
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
+                GGML_ASSERT(tensor->ne[axis] == d_inner + 2*n_group*d_state);
+                return {{d_inner, 1}, {n_group*d_state, 2}};
+            }
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                const int64_t n_hist = hparams.ssm_d_conv - 1;
+                GGML_ASSERT(tensor->ne[axis] == n_hist*(d_inner + 2*n_group*d_state));
+                return {{n_hist*d_inner, 1}, {n_hist*n_group*d_state, 2}};
+            }
+        }
+
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
@@ -667,6 +708,54 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        const bool is_nemotron_h = ud->model->arch == LLM_ARCH_NEMOTRON_H || ud->model->arch == LLM_ARCH_NEMOTRON_H_MOE;
+        if (is_nemotron_h && hparams.is_recr(il)) {
+            const int64_t d_inner         = hparams.ssm_d_inner;
+            const int64_t d_state         = hparams.ssm_d_state;
+            const int64_t n_group         = hparams.ssm_n_group;
+            const int64_t n_head          = hparams.ssm_dt_rank;
+
+            GGML_ASSERT(n_head > 0);
+            GGML_ASSERT(n_group > 0);
+            GGML_ASSERT(d_inner % n_head == 0);
+            GGML_ASSERT(n_head % n_group == 0);
+
+            const int64_t head_dim        = d_inner / n_head;
+            const int64_t heads_per_group = n_head / n_group;
+            const int64_t group_width     = heads_per_group * head_dim;
+
+            if (std::regex_match(tensor_name, pattern_ssm_in)) {
+                GGML_ASSERT(segments.size() == 3);
+                return {std::lcm(blck_size, group_width), d_state, heads_per_group};
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
+                GGML_ASSERT(segments.size() == 2);
+                return {std::lcm(blck_size, group_width), d_state};
+            }
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                GGML_ASSERT(segments.size() == 2);
+                const int64_t n_hist = hparams.ssm_d_conv - 1;
+                return {n_hist*group_width, n_hist*d_state};
+            }
+            if (std::regex_match(tensor_name, pattern_s_cache)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {d_state*group_width};
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
+                    std::regex_match(tensor_name, pattern_ssm_d)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {heads_per_group};
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_norm)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {1};
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {std::lcm(blck_size, group_width)};
+            }
+        }
+
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
