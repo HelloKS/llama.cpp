@@ -132,10 +132,15 @@ llama_model_nemotron_h_mtp::graph::graph(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
-    build_inp_pos();
-    auto * inp_attn       = build_attn_inp_kv();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // === Fusion: norm → concat → project ===
+    // attention fills KV over all tokens, but the FFN is position-wise
+    const bool emit_h_nextn    = cparams.embeddings_nextn;
+    const bool crop_before_ffn = inp_out_ids && (!emit_h_nextn || cparams.embeddings_nextn_masked);
+
+    auto * inp_attn = build_attn_inp_kv();
+
+    // === Fusion: norm -> concat -> project ===
     ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
@@ -164,12 +169,16 @@ llama_model_nemotron_h_mtp::graph::graph(const llama_model & model, const llm_gr
             layer.wo, layer.wo_b, layer.wo_s,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "mtp_attn_out", il);
-    // NOTE: no residual add here — follows vLLM AttentionDecoderLayer pattern
+    // NOTE: no residual add here - follows vLLM AttentionDecoderLayer pattern
 
     // === FFN/MoE layer ===
     // vLLM pre-norm residual: hidden_states += residual (on layer entry)
     cur = ggml_add(ctx0, cur, residual);  // attn_output + fused
     cb(cur, "mtp_attn_add_residual", il);
+
+    if (crop_before_ffn) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     // Save summed value as new residual for end_norm
     residual = cur;
@@ -251,8 +260,12 @@ llama_model_nemotron_h_mtp::graph::graph(const llama_model & model, const llm_gr
     cb(cur, "h_pre_norm", -1);
     res->t_h_nextn = cur;
 
+    if (!crop_before_ffn && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     // === LM head ===
-    // No additional norm here — end_norm (shared_head_norm) already applied above.
+    // No additional norm here - end_norm (shared_head_norm) already applied above.
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "NEMOTRON_H_MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur);
