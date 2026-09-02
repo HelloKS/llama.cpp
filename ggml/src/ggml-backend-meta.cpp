@@ -810,6 +810,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
+    auto handle_ssm_scan = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return handle_generic(src_ss, /*scalar_only =*/ true);
+        }
+
+        GGML_ASSERT(src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        for (size_t i = 0; i < 6; ++i) {
+            GGML_ASSERT(src_ss[i].axis >= 0 && src_ss[i].axis < GGML_MAX_DIMS);
+        }
+
+        return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+    };
+
     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
@@ -1018,7 +1031,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SSM_CONV: {
                 split_state = handle_ssm_conv(src_ss);
             } break;
-            case GGML_OP_SSM_SCAN:
+            case GGML_OP_SSM_SCAN: {
+                split_state = handle_ssm_scan(src_ss);
+            } break;
             case GGML_OP_WIN_PART:
             case GGML_OP_WIN_UNPART:
             case GGML_OP_GET_REL_POS:
