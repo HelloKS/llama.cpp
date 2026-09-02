@@ -141,7 +141,9 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
             }
             ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
         } else {
-            ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
+            if (pos && pos->buffer) {
+                ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
+            }
         }
     }
 }

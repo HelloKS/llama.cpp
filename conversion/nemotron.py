@@ -513,3 +513,152 @@ class NemotronHModel(GraniteHybridModel):
             experts = [k for d in self._experts for k in d.keys()]
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
+
+
+@ModelBase.register("NemotronHMTPForCausalLM")
+class NemotronHMTPModel(NemotronHModel):
+    """Nemotron H model with Multi-Token Prediction (MTP/NextN) heads"""
+    model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MTP
+
+    def __init__(self, *args, **kwargs):
+        hparams = ModelBase.load_hparams(args[0], self.is_mistral_format)
+        has_moe_params = (
+            "num_experts_per_tok" in hparams
+            or (isinstance(hparams.get("llm_config"), dict) and "num_experts_per_tok" in hparams["llm_config"])
+        )
+        if has_moe_params:
+            self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MTP
+            self.is_moe = True
+
+        super().__init__(*args, **kwargs)
+
+        # Expand block_count so that tensor_map recognizes blk.{n_main} index
+        mtp_config = self.hparams.get("mtp_config") or self.hparams.get("multi_token_prediction")
+        n_mtp = 0
+        if mtp_config and isinstance(mtp_config, dict):
+            n_mtp = mtp_config.get("num_mtp_blocks") or mtp_config.get("num_layers", 1)
+        self.block_count = self.hparams["num_hidden_layers"] + n_mtp
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        # Buffer for collecting MTP expert tensors to merge
+        self._mtp_experts: dict[str, Tensor] | None = None
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # Add nextn_predict_layers if mtp config exists
+        mtp_config = self.hparams.get("mtp_config") or self.hparams.get("multi_token_prediction")
+        if mtp_config and isinstance(mtp_config, dict):
+            mtp_layers = mtp_config.get("num_mtp_blocks") or mtp_config.get("num_layers", 1)
+            self.gguf_writer.add_nextn_predict_layers(mtp_layers)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if not name.startswith("mtp."):
+            # Non-MTP (trunk) tensor: let parent class handle it
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
+        n_main = self.hparams["num_hidden_layers"]
+        il = n_main  # All MTP tensors are stored in blk.{n_main}
+
+        # --- mtp.layers.0.* : Attention sub-block + fusion ---
+        if name.startswith("mtp.layers.0."):
+            remainder = name.removeprefix("mtp.layers.0.")
+
+            # Fusion tensors
+            if remainder == "eh_proj.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, il), data_torch)
+                return
+            if remainder == "enorm.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_ENORM, il), data_torch)
+                return
+            if remainder == "hnorm.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_HNORM, il), data_torch)
+                return
+
+            # attn_norm
+            if remainder == "norm.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_NORM, il), data_torch)
+                return
+
+            # Attention projections: mtp.layers.0.mixer.{q,k,v,o}_proj.weight
+            if remainder.startswith("mixer."):
+                mixer_part = remainder.removeprefix("mixer.")
+                attn_map = {
+                    "q_proj.weight": gguf.MODEL_TENSOR.ATTN_Q,
+                    "k_proj.weight": gguf.MODEL_TENSOR.ATTN_K,
+                    "v_proj.weight": gguf.MODEL_TENSOR.ATTN_V,
+                    "o_proj.weight": gguf.MODEL_TENSOR.ATTN_OUT,
+                }
+                if mixer_part in attn_map:
+                    yield (self.format_tensor_name(attn_map[mixer_part], il), data_torch)
+                    return
+
+        # --- mtp.layers.1.* : MoE sub-block ---
+        elif name.startswith("mtp.layers.1."):
+            remainder = name.removeprefix("mtp.layers.1.")
+
+            # shared_head_norm
+            if remainder == "final_layernorm.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, il), data_torch)
+                return
+
+            if remainder.startswith("mixer."):
+                mixer_part = remainder.removeprefix("mixer.")
+
+                # Router gate
+                if mixer_part == "gate.weight":
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_INP, il), data_torch)
+                    return
+
+                # Expert score correction bias
+                if mixer_part == "gate.e_score_correction.bias":
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_EXP_PROBS_B, il), data_torch)
+                    return
+
+                # Shared experts
+                if mixer_part == "shared_experts.up_proj.weight":
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP_SHEXP, il), data_torch)
+                    return
+                if mixer_part == "shared_experts.down_proj.weight":
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, il), data_torch)
+                    return
+
+                # Routed experts: collect and merge (same pattern as trunk)
+                if "experts" in mixer_part and "shared" not in mixer_part:
+                    n_experts = self.hparams["n_routed_experts"]
+
+                    if self._mtp_experts is None:
+                        self._mtp_experts = {}
+
+                    self._mtp_experts[name] = data_torch
+
+                    # Check if all expert tensors have been collected (up + down = n_experts * 2)
+                    if len(self._mtp_experts) >= n_experts * 2:
+                        for w_name in ["down_proj", "up_proj"]:
+                            datas: list[Tensor] = []
+                            for xid in range(n_experts):
+                                key = f"mtp.layers.1.mixer.experts.{xid}.{w_name}.weight"
+                                datas.append(self._mtp_experts[key])
+                                del self._mtp_experts[key]
+
+                            merged = torch.stack(datas, dim=0)
+
+                            # Determine gguf tensor type
+                            if w_name == "up_proj":
+                                tensor_type = gguf.MODEL_TENSOR.FFN_UP_EXP
+                            else:
+                                tensor_type = gguf.MODEL_TENSOR.FFN_DOWN_EXP
+
+                            yield (self.format_tensor_name(tensor_type, il), merged)
+                    return
+
+        # Unrecognized MTP tensor
+        logger.info(f"gguf: Skipping unrecognized MTP tensor: {name}")
+        return
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._mtp_experts:
+            remaining = list(self._mtp_experts.keys())
+            if remaining:
+                raise ValueError(f"Unprocessed MTP experts: {remaining}")

@@ -92,6 +92,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NEMOTRON,         "nemotron"         },
     { LLM_ARCH_NEMOTRON_H,       "nemotron_h"       },
     { LLM_ARCH_NEMOTRON_H_MOE,   "nemotron_h_moe"   },
+    { LLM_ARCH_NEMOTRON_H_MTP,   "nemotron_h_mtp"   },
     { LLM_ARCH_EXAONE,           "exaone"           },
     { LLM_ARCH_EXAONE4,          "exaone4"          },
     { LLM_ARCH_EXAONE_MOE,       "exaone-moe"       },

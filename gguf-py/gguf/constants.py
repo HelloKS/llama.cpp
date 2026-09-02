@@ -567,6 +567,7 @@ class MODEL_ARCH(IntEnum):
     NEMOTRON         = auto()
     NEMOTRON_H       = auto()
     NEMOTRON_H_MOE   = auto()
+    NEMOTRON_H_MTP   = auto()
     EXAONE           = auto()
     EXAONE4          = auto()
     EXAONE_MOE       = auto()
@@ -1315,6 +1316,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NEMOTRON:         "nemotron",
     MODEL_ARCH.NEMOTRON_H:       "nemotron_h",
     MODEL_ARCH.NEMOTRON_H_MOE:   "nemotron_h_moe",
+    MODEL_ARCH.NEMOTRON_H_MTP:   "nemotron_h_mtp",
     MODEL_ARCH.EXAONE:           "exaone",
     MODEL_ARCH.EXAONE4:          "exaone4",
     MODEL_ARCH.EXAONE_MOE:       "exaone-moe",
@@ -4146,6 +4148,44 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_ENORM,
         MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+    ],
+    MODEL_ARCH.NEMOTRON_H_MTP: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        # SSM (recurrent layers)
+        MODEL_TENSOR.SSM_IN,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_D,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_OUT,
+        # Attention layers
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        # FFN layers
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        # MoE
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.MOE_LATENT_DOWN,
+        MODEL_TENSOR.MOE_LATENT_UP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        # NextN/MTP
+        MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     MODEL_ARCH.EXAONE: [

@@ -226,6 +226,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_nemotron_h(params);
         case LLM_ARCH_NEMOTRON_H_MOE:
             return new llama_model_nemotron_h_moe(params);
+        case LLM_ARCH_NEMOTRON_H_MTP:
+            return new llama_model_nemotron_h_mtp(params);
         case LLM_ARCH_EXAONE:
             return new llama_model_exaone(params);
         case LLM_ARCH_EXAONE4:
@@ -2564,7 +2566,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
-                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
+                    if (arch == LLM_ARCH_NEMOTRON_H_MTP || mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
@@ -2940,6 +2942,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_NEMOTRON_H_MTP:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:
