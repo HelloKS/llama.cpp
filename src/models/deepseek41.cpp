@@ -506,7 +506,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
-        if (hparams.dsv41_engram_layers.test(il)) {
+        if (ubatch.token && hparams.dsv41_engram_layers.test(il)) {
             auto engram_inp =
                 std::make_unique<llm_graph_input_dsv41_engram>(model, inp_attn->mctx->get_raw(), engram_module++);
             engram_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hash_heads * n_tokens);
@@ -560,8 +560,12 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         cur = build_hc_pre(inpL, attn_pre, il);
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
+        ggml_tensor * exp_probs_b = ubatch.embd ? layer.ffn_exp_probs_b_vl : layer.ffn_exp_probs_b;
+        if (!exp_probs_b) {
+            throw std::runtime_error("DeepSeek-V4.1 image input requires vision expert routing biases");
+        }
         ggml_tensor * moe = build_moe_ffn(cur, layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps,
-                                          layer.ffn_down_exps, layer.ffn_exp_probs_b, n_expert, hparams.n_expert_used(),
+                                          layer.ffn_down_exps, exp_probs_b, n_expert, hparams.n_expert_used(),
                                           LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
                                           (llama_expert_gating_func_type) hparams.expert_gating_func, il);
         ggml_tensor * shared =

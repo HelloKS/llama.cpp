@@ -131,18 +131,20 @@ struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
 
 // ref: inference/image_processor.py in the HF repo (DeepSeek-V4-Flash-Vision)
 struct mtmd_image_preprocessor_deepseek4v : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_deepseek4v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_deepseek4v(const clip_ctx * ctx, bool is_v41 = false) : mtmd_image_preprocessor(ctx), is_v41(is_v41) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+    static clip_image_size get_target_size(const clip_hparams & hparams, const clip_image_size & orig, bool is_v41);
 
 private:
+    const bool is_v41;
     struct grid_info {
         int n_llm_h;
         int n_llm_w;
         int n_tokens; // token count of the block (incl. newline/pad rows and start/end, excl. lead pads)
     };
-    static grid_info grid_tokens(int best_height, int best_width, int patch_size, int r);
-    static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width);
-    static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
+    static grid_info grid_tokens(int best_height, int best_width, int patch_size, int r, bool is_v41);
+    static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width, bool is_v41);
+    static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token, bool is_v41);
 };
 
 // custom llava-uhd slicing logic for MiniCPM-V

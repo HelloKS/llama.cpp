@@ -70,6 +70,33 @@ MAKE_TEST(test_image_preprocessor_lfm2) {
     }
 }
 
+MAKE_TEST(test_image_preprocessor_deepseek41) {
+    clip_hparams hparams;
+    hparams.patch_size = 14;
+    hparams.n_merge = 3;
+    hparams.image_min_pixels = 295936;
+
+    const std::vector<std::tuple<clip_image_size, clip_image_size, clip_image_size>> cases = {
+        {{512, 512},   {546, 546},  {546, 546}},
+        {{1920, 1080}, {1708, 966}, {1036, 588}},
+        {{1080, 1920}, {966, 1708}, {560, 1008}},
+        {{4096, 4096}, {1302, 1302}, {756, 756}},
+        {{100000, 1}, {42882, 42}, {1540, 196}},
+        {{1, 100000}, {42, 21462}, {42, 7896}},
+    };
+
+    for (const auto & [input, expected_v41, expected_v4] : cases) {
+        for (bool is_v41 : {false, true}) {
+            hparams.dsv4_max_n_token = is_v41 ? 1024 : 384;
+            hparams.dsv4_max_wh_ratio = is_v41 ? 0 : 8;
+            const auto actual = mtmd_image_preprocessor_deepseek4v::get_target_size(hparams, input, is_v41);
+            const auto expected = is_v41 ? expected_v41 : expected_v4;
+            t.assert_equal("resize width", expected.width, actual.width);
+            t.assert_equal("resize height", expected.height, actual.height);
+        }
+    }
+}
+
 //
 // mtmd temporal merge
 //

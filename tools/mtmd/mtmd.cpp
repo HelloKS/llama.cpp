@@ -827,9 +827,10 @@ struct mtmd_context {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_longest_edge>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_DEEPSEEK4V:
+            case PROJECTOR_TYPE_DEEPSEEK41V:
                 {
                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v, proj_type_v() == PROJECTOR_TYPE_DEEPSEEK41V);
                 } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:

@@ -1150,30 +1150,30 @@ clip_image_size mtmd_image_preprocessor_deepseekocr::find_closest_aspect_ratio(
 //
 
 // ref: grid_tokens()
-mtmd_image_preprocessor_deepseek4v::grid_info mtmd_image_preprocessor_deepseek4v::grid_tokens(int best_height, int best_width, int patch_size, int r) {
+mtmd_image_preprocessor_deepseek4v::grid_info mtmd_image_preprocessor_deepseek4v::grid_tokens(int best_height, int best_width, int patch_size, int r, bool is_v41) {
     grid_info g;
     g.n_llm_h = ((best_height / patch_size) + r - 1) / r;
     g.n_llm_w = ((best_width  / patch_size) + r - 1) / r;
-    g.n_tokens = dsv4_get_block_layout(g.n_llm_w, g.n_llm_h, 0).n_out;
+    g.n_tokens = is_v41 ? g.n_llm_h * (g.n_llm_w + 1) + 2 : dsv4_get_block_layout(g.n_llm_w, g.n_llm_h, 0).n_out;
     return g;
 }
 
 // ref: solve_resize_ratio()
 void mtmd_image_preprocessor_deepseek4v::solve_resize_ratio(int height, int width, int p, int r, int max_n_token,
-                                                            int & best_height, int & best_width) {
+                                                            int & best_height, int & best_width, bool is_v41) {
     const double ratio   = (double) height / width;
     const double max_w_f = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
     const double max_h_f = max_w_f * ratio;
     if (max_w_f < 1.0) {
         const int max_w = 1;
         int max_h = (max_n_token - 2) / (max_w + 1);
-        if (max_h % 2 == 1) {
+        if (!is_v41 && max_h % 2 == 1) {
             max_h -= 1;
         }
         best_width  = max_w * p * r;
         best_height = max_h * p * r;
-    } else if (max_h_f < 2.0) {
-        const int max_h = 2;
+    } else if (max_h_f < (is_v41 ? 1.0 : 2.0)) {
+        const int max_h = is_v41 ? 1 : 2;
         // guard tiny budgets; cannot be hit with the current lower bound on max_n_token
         const int max_w = std::max(((max_n_token - 2) / max_h) - 1, 2);
         best_width  = max_w * p * r;
@@ -1181,7 +1181,7 @@ void mtmd_image_preprocessor_deepseek4v::solve_resize_ratio(int height, int widt
     } else {
         const int max_w_i = (int) std::floor(max_w_f);
         int max_h_i = (int) std::floor(max_h_f);
-        if (max_h_i % 2 == 1) {
+        if (!is_v41 && max_h_i % 2 == 1) {
             max_h_i -= 1;
         }
         const double beta = std::min(
@@ -1194,27 +1194,25 @@ void mtmd_image_preprocessor_deepseek4v::solve_resize_ratio(int height, int widt
 
 // ref: safe_resize()
 void mtmd_image_preprocessor_deepseek4v::safe_resize(int height, int width, int & best_height, int & best_width,
-                                                     int p, int r, int max_n_token) {
-    max_n_token -= 4 - 1; // reserve room for the position-dependent lead pads (COMPRESS_PAD_TO - 1)
-    grid_info g = grid_tokens(best_height, best_width, p, r);
+                                                     int p, int r, int max_n_token, bool is_v41) {
+    if (!is_v41) {
+        max_n_token -= 4 - 1; // reserve room for the position-dependent lead pads (COMPRESS_PAD_TO - 1)
+    }
+    grid_info g = grid_tokens(best_height, best_width, p, r, is_v41);
     int budget = max_n_token;
     while (g.n_tokens > max_n_token) {
-        solve_resize_ratio(height, width, p, r, budget, best_height, best_width);
-        g = grid_tokens(best_height, best_width, p, r);
+        solve_resize_ratio(height, width, p, r, budget, best_height, best_width, is_v41);
+        g = grid_tokens(best_height, best_width, p, r, is_v41);
         budget -= 1;
     }
 }
 
-// ref: load_image()
-mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip_image_u8 & img) const {
-    mtmd_image_preproc_out out;
-
+clip_image_size mtmd_image_preprocessor_deepseek4v::get_target_size(const clip_hparams & hparams, const clip_image_size & orig, bool is_v41) {
     const int p           = hparams.patch_size;
     const int r           = hparams.n_merge;
     const int max_n_token = hparams.dsv4_max_n_token;
     const int max_wh      = hparams.dsv4_max_wh_ratio;
 
-    const clip_image_size orig = img.get_size();
     int width  = orig.width;
     int height = orig.height;
     if (max_wh > 0 && width > height * max_wh) {
@@ -1228,15 +1226,24 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
     }
     int best_width  = CLIP_ALIGN(width,  p);
     int best_height = CLIP_ALIGN(height, p);
-    safe_resize(height, width, best_height, best_width, p, r, max_n_token);
+    safe_resize(height, width, best_height, best_width, p, r, max_n_token, is_v41);
+    return {best_width, best_height};
+}
+
+// ref: load_image()
+mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip_image_u8 & img) const {
+    mtmd_image_preproc_out out;
+    const clip_image_size orig = img.get_size();
+    const clip_image_size target = get_target_size(hparams, orig, is_v41);
+    const int max_wh = hparams.dsv4_max_wh_ratio;
 
     clip_image_u8 resized;
     if (max_wh > 0 && orig.width >= max_wh * orig.height) {
         // extreme aspect ratio: plain stretch resize, no padding
-        img_tool::resize(img, resized, {best_width, best_height}, hparams.image_resize_algo, PAD_NONE);
+        img_tool::resize(img, resized, target, hparams.image_resize_algo, PAD_NONE);
     } else {
         // aspect-preserving resize + centered padding (PIL ImageOps.pad)
-        img_tool::resize(img, resized, {best_width, best_height}, hparams.image_resize_algo,
+        img_tool::resize(img, resized, target, hparams.image_resize_algo,
                          PAD_NEAREST, hparams.image_pad_color);
     }
 

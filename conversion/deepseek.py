@@ -1374,6 +1374,8 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
 @ModelBase.register("DeepseekV4ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-Vision-Exp")
 class DeepseekV4FlashVisionModel(MmprojModel):
+    projector_type = gguf.VisionProjectorType.DEEPSEEK4V
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
@@ -1405,7 +1407,7 @@ class DeepseekV4FlashVisionModel(MmprojModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         assert self.hparams_vision is not None
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.DEEPSEEK4V)
+        self.gguf_writer.add_clip_projector_type(self.projector_type)
         # vision RMSNorm eps is the pytorch default, NOT the LLM's rms_norm_eps (1e-20)
         # ref: inference/vision.py (RMSNorm)
         self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
@@ -1414,8 +1416,9 @@ class DeepseekV4FlashVisionModel(MmprojModel):
         self.gguf_writer.add_vision_min_pixels(self.hparams_vision["min_pixels"])
         # hardcoded on the C++ side (see PROJECTOR_TYPE_DEEPSEEK4V in clip.cpp)
         # if future models use different values, add GGUF keys for those
-        assert self.global_config["vision_max_n_token"] == 384
-        assert self.global_config["vision_max_wh_ratio"] == 8
+        if self.projector_type == gguf.VisionProjectorType.DEEPSEEK4V:
+            assert self.global_config["vision_max_n_token"] == 384
+            assert self.global_config["vision_max_wh_ratio"] == 8
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -1439,3 +1442,18 @@ class DeepseekV4FlashVisionModel(MmprojModel):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41FlashVisionModel(DeepseekV4FlashVisionModel):
+    projector_type = gguf.VisionProjectorType.DEEPSEEK41V
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        cfg = self.global_config["vision_config"]
+        assert cfg["max_image_tokens"] == 1024
+        assert cfg["max_wh_ratio"] is None
+        return {
+            **cfg,
+            "image_size": cfg["patch_size"] * cfg["downsample_ratio"] * 16,
+        }
