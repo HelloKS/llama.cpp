@@ -1332,6 +1332,7 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
 
 @ModelBase.register("DeepseekV41DSparkModel")
 class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
     supports_mtp_export = False
 
     _DSPARK_ROOT_MAP = {
