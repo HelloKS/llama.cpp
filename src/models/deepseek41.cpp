@@ -370,7 +370,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
     ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), dim, n_head, nt);
-    q = rope(ggml_rms_norm(ctx0, q, norm_rms_eps), inp_pos);
+    q = rope(q, inp_pos);
     ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
     kv = rope(ggml_reshape_3d(ctx0, kv, dim, 1, nt), inp_pos);
 
