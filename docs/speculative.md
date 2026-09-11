@@ -103,8 +103,17 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 `--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
-Currently only drafts with a Qwen3 backbone are supported; support for other backbones
-(e.g. Gemma4) is planned.
+DeepSeek-V4.1-Flash includes its DSpark stages in the target checkpoint. Export them separately with the updated converter:
+
+```bash
+python convert_hf_to_gguf.py ds41 --dspark --target-model-dir ds41 \
+    --outfile ds41-dspark.gguf
+
+llama-server -m model.gguf -md ds41-dspark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 5 --lazy-mode on -fa on
+```
+
+The draft shares the target's token embeddings and output head at inference time. Adding DSpark does not require converting or quantizing an existing V4.1 target GGUF again. Rebuild the client and RPC servers from the same revision before using the new draft.
 
 DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
 (for example [`RedHatAI/gemma-4-31B-it-speculator.dspark`](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dspark))

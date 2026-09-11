@@ -534,6 +534,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             cb(inpL, "engram_out", il);
         }
 
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc, n_tokens), 1.0f / hc);
+            res->t_layer_inp[il] = build_hc_pre(inpL, weights, il);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * residual  = inpL;
         ggml_tensor * attn_pre  = nullptr;
         ggml_tensor * attn_post = nullptr;

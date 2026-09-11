@@ -1067,6 +1067,9 @@ class GGUFWriter:
     def add_hyper_connection_count(self, count: int) -> None:
         self.add_uint32(Keys.HyperConnection.COUNT.format(arch=self.arch), count)
 
+    def add_hyper_connection_single_pass(self, value: bool) -> None:
+        self.add_bool(Keys.HyperConnection.SINGLE_PASS.format(arch=self.arch), value)
+
     def add_hyper_connection_sinkhorn_iterations(self, count: int) -> None:
         self.add_uint32(Keys.HyperConnection.SINKHORN_ITERATIONS.format(arch=self.arch), count)
 

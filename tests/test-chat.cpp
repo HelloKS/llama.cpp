@@ -4129,6 +4129,27 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    {
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja", detailed_debug);
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+        tst.test(
+                "Let me check the time</think>\n\n"
+                "<｜DSML｜ calls>\n"
+                "<｜DSML｜ invoke name=\"get_time\">\n"
+                "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
+                "</｜DSML｜ invoke>\n"
+                "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check the time"))
+            .run();
+    }
+
     // DeepSeek V4 tests - same DSML markup as V3.2, but the tool call block is named
     // "tool_calls" and the non-thinking generation prompt ends in a bare </think>
     // instead of an empty <think></think> pair.
@@ -6755,6 +6776,24 @@ static void test_template_generation_prompt() {
 
     const std::string deepseek_v4_reasoning_effort_max = "Reasoning Effort: Absolute maximum";
     const std::string deepseek_v4_flash_0731_reasoning_effort_max = "Reasoning Effort: Beyond maximum";
+
+    {
+        auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja");
+        check(tmpls, basic(), "<｜Assistant｜><think>");
+        for (const auto & effort : std::vector<std::pair<std::string, int>>{{"low", 50}, {"high", 75}, {"max", 100}}) {
+            common_chat_templates_inputs inputs;
+            inputs.messages = { message_user };
+            inputs.enable_thinking = true;
+            inputs.add_generation_prompt = true;
+            inputs.chat_template_kwargs["reasoning_effort"] = json(effort.first).dump();
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_contains(params.prompt, "<｜System｜>Reasoning Effort: " + std::to_string(effort.second) +
+                    " (range 1-100, the higher the value, the more thorough the reasoning)\n\n");
+            inputs.enable_thinking = false;
+            params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_not_contains(params.prompt, "Reasoning Effort:");
+        }
+    }
 
     {
         auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.jinja");

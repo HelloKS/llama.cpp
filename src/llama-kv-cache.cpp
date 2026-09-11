@@ -1054,7 +1054,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
                         // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        const llama_pos pos_next = cells.seq_pos_max(seq_id_cell) + (hparams.dsv4_hc_single_pass ? 0 : 1);
+                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, pos_next)) {
                             can_use = true;
                         }
                     }
@@ -1683,7 +1684,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (swa) {
                     // see llama_non_causal_type
                     const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
-                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    // V4.1 DSpark attends to the same past window and full noise block at every draft position.
+                    const bool dspark = !causal && args.hparams.dsv4_hc_single_pass;
+                    const llama_pos pos_swa = dspark ? std::max(0, seq_pos_min[seq_id] - 1) : p1;
+                    if (!in_span && !(dspark && p0 >= seq_pos_min[seq_id]) && llama_hparams::is_masked_swa(n_swa, swa_type, p0, pos_swa)) {
                         goto skip;
                     }
                 }

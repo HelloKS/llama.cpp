@@ -234,6 +234,7 @@ class Keys:
 
     class HyperConnection:
         COUNT                = "{arch}.hyper_connection.count"
+        SINGLE_PASS          = "{arch}.hyper_connection.single_pass"
         SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"
         EPSILON              = "{arch}.hyper_connection.epsilon"
         # scale of the post gate (DeepSeek-V4 hardcodes 2.0)

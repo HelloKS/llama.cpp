@@ -313,6 +313,7 @@ void llama_model_saver::add_kv_from_model() {
         add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,         hparams.dsv4_compress_ratios, true);
     }
     add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+    add_kv(LLM_KV_HYPER_CONNECTION_SINGLE_PASS,         hparams.dsv4_hc_single_pass);
     add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE,           hparams.hc_magnitude);

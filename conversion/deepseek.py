@@ -565,6 +565,8 @@ class DeepseekV4Model(TextModel):
         model_id_hint = self.remote_hf_model_id or self.dir_model.name
         is_0731 = "0731" in model_id_hint
         template_name = "deepseek-ai-DeepSeek-V4-Flash-0731.jinja" if is_0731 else "deepseek-ai-DeepSeek-V4.jinja"
+        if self.model_arch == gguf.MODEL_ARCH.DEEPSEEK41:
+            template_name = "deepseek-ai-DeepSeek-V4.1-Flash.jinja"
         template_path = Path(__file__).parent.parent / "models" / "templates" / template_name
         if template_path.is_file():
             with open(template_path, "r", encoding="utf-8") as f:
@@ -1278,8 +1280,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             return None
         return super().filter_tensors((cls._rekey_mtp_tensor_name(name), gen))
 
-    @staticmethod
-    def _rekey_mtp_tensor_name(name: str) -> str:
+    @classmethod
+    def _rekey_mtp_tensor_name(cls, name: str) -> str:
         match = re.match(r"mtp\.(\d+)\.(.+)$", name)
         if match is None:
             raise ValueError(f"Unexpected DSpark tensor {name!r}")
@@ -1292,7 +1294,7 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             "hc_head_base",
             "hc_head_scale",
         )
-        if rest in DeepseekV4DSparkModel._DSPARK_ROOT_MAP or rest in root_names:
+        if rest in cls._DSPARK_ROOT_MAP or rest in root_names:
             return rest
         return f"layers.{stage}.{rest}"
 
@@ -1326,6 +1328,47 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
 
         self.gguf_writer.add_block_size(self.hparams["dspark_block_size"])
         self.gguf_writer.add_target_layers([layer + 1 for layer in self.hparams["dspark_target_layer_ids"]])
+
+
+@ModelBase.register("DeepseekV41DSparkModel")
+class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
+    supports_mtp_export = False
+
+    _DSPARK_ROOT_MAP = {
+        **DeepseekV4DSparkModel._DSPARK_ROOT_MAP,
+        "markov_head.embed.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.head.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+    }
+
+    _fp8_block_shape = staticmethod(DeepseekV41Model._fp8_block_shape)
+    _dequant_fp8_weight = DeepseekV41Model._dequant_fp8_weight
+    dequant_model = DeepseekV41Model.dequant_model
+    _write_mxfp4_expert_tensor = DeepseekV41Model._write_mxfp4_expert_tensor
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.block_count != self.hparams["num_nextn_predict_layers"]:
+            raise ValueError("DeepSeek-V4.1 DSpark stage count does not match the config")
+        self.hparams["n_routed_experts"] = self.hparams["dspark_n_routed_experts"]
+        self.hparams["num_experts_per_tok"] = self.hparams["dspark_num_experts_per_tok"]
+        self.hparams["num_hidden_layers"] = self.block_count
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        hparams = self.hparams
+        self.hparams = {**hparams, **hparams.get("text_config", {})}
+        try:
+            return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+        finally:
+            self.hparams = hparams
+
+    def set_gguf_parameters(self):
+        DeepseekV4Model.set_gguf_parameters(self)
+        self.gguf_writer.add_hyper_connection_single_pass(True)
+        self.gguf_writer.add_block_size(self.hparams["dspark_block_size"])
+        # V4.1 trains on layer inputs, so the indices need no output-to-input shift.
+        self.gguf_writer.add_target_layers(self.hparams["dspark_target_layer_ids"])
+        self.gguf_writer.add_sample_from_anchor(True)
+        self.gguf_writer.add_has_confidence_head(True)
 
 
 @ModelBase.register("DeepseekV4ForCausalLM")

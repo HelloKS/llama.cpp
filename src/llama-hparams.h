@@ -288,6 +288,7 @@ struct llama_hparams {
     uint32_t dsv4_o_group_count        = 0;
     uint32_t dsv4_o_lora_rank          = 0;
     uint32_t dsv4_hc_mult              = 0;
+    bool     dsv4_hc_single_pass       = false;
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
     uint32_t dsv4_hash_layer_count     = 0;
     float    dsv4_compress_rope_base   = 0.0f;
