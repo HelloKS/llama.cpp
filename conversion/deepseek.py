@@ -945,6 +945,41 @@ class DeepseekV41Model(DeepseekV4Model):
         finally:
             self.hparams = hparams
 
+    def _write_mxfp4_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
+        n_experts = self.hparams["n_routed_experts"]
+        chunks = []
+        consumed: list[str] = []
+        packed_shape = None
+
+        for eid in range(n_experts):
+            weight_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.weight"
+            scale_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.scale"
+            if weight_name not in self.model_tensors or scale_name not in self.model_tensors:
+                raise KeyError(f"Missing routed expert tensors for {weight_name}")
+            weight = self.model_tensors[weight_name]
+            scale = self.model_tensors[scale_name]
+            rows, packed_cols = weight().shape
+            if packed_cols % 16 != 0 or tuple(scale().shape) != (rows, packed_cols // 16):
+                raise ValueError(f"MXFP4 scale shape does not match {weight_name}")
+            shape = (rows, packed_cols // 16 * 17)
+            if packed_shape is not None and packed_shape != shape:
+                raise ValueError(f"Inconsistent routed expert shape for {weight_name}")
+            packed_shape = shape
+
+            def load(weight=weight, scale=scale) -> np.ndarray:
+                return self.repack_mxfp4_blocks(LazyTorchTensor.to_eager(weight()), LazyTorchTensor.to_eager(scale()))
+
+            chunks.append(load)
+            consumed.extend((weight_name, scale_name))
+
+        assert packed_shape is not None
+        data = gguf.LazyChunkedTensor(chunks, (n_experts, *packed_shape), np.uint8)
+        new_name = self.format_tensor_name(tensor_key, bid)
+        shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
+        logger.info(f"{new_name}: streaming routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
+        self.gguf_writer.add_tensor(new_name, cast(Any, data), raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+        return consumed
+
     @staticmethod
     def _fp8_block_shape(weight: Tensor, scale: Tensor) -> tuple[int, int]:
         if weight.ndim != 2 or scale.ndim != 2:
