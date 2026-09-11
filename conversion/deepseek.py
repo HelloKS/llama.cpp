@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 
-from typing import Any, Callable, Iterable, TYPE_CHECKING
+from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -922,6 +922,265 @@ class DeepseekV4Model(TextModel):
         super().prepare_tensors()
         self._is_mxfp4 = True
         self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41Model(DeepseekV4Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK41
+    supports_mtp_export = False
+
+    def __init__(self, *args, **kwargs):
+        self._dsv41_token_map: np.ndarray | None = None
+        self._dsv41_engram_tables: set[str] = set()
+        super().__init__(*args, **kwargs)
+        self.hparams["num_hash_layers"] = 0
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        hparams = self.hparams
+        text_config = hparams.get("text_config", {})
+        self.hparams = {**hparams, **text_config}
+        try:
+            return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+        finally:
+            self.hparams = hparams
+
+    @staticmethod
+    def _fp8_block_shape(weight: Tensor, scale: Tensor) -> tuple[int, int]:
+        if weight.ndim != 2 or scale.ndim != 2:
+            raise ValueError(f"Expected 2D FP8 weight and scale, got {weight.shape} and {scale.shape}")
+        if weight.shape[0] % scale.shape[0] != 0 or weight.shape[1] % scale.shape[1] != 0:
+            raise ValueError(f"FP8 scale shape {scale.shape} does not divide weight shape {weight.shape}")
+        return weight.shape[0] // scale.shape[0], weight.shape[1] // scale.shape[1]
+
+    def _dequant_fp8_weight(self, weight: Tensor, scale: Tensor) -> Tensor:
+        block_rows, block_cols = self._fp8_block_shape(weight, scale)
+        scale_f = self._e8m0_to_float(scale)
+        scale_f = scale_f.repeat_interleave(block_rows, 0)
+        scale_f = scale_f.repeat_interleave(block_cols, 1)
+        return weight.float() * scale_f
+
+    def dequant_model(self):
+        fp8_dtypes = self._float8_dtypes()
+        tensors_to_remove: list[str] = []
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".scale") or ".engram.embed." in name:
+                continue
+            weight_name = name.removesuffix(".scale") + ".weight"
+            if weight_name not in self.model_tensors:
+                continue
+
+            weight = self.model_tensors[weight_name]
+            scale = self.model_tensors[name]
+            if weight().dtype not in fp8_dtypes:
+                continue
+
+            self.model_tensors[weight_name] = lambda w=weight, s=scale: self._dequant_fp8_weight(w(), s())
+            self._dsv4_fp8_dequantized.add(weight_name)
+            tensors_to_remove.append(name)
+
+        for name in tensors_to_remove:
+            del self.model_tensors[name]
+
+    @staticmethod
+    def _find_next_prime(start: int, seen: set[int]) -> int:
+        def is_prime(value: int) -> bool:
+            if value < 2:
+                return False
+            if value % 2 == 0:
+                return value == 2
+            factor = 3
+            while factor * factor <= value:
+                if value % factor == 0:
+                    return False
+                factor += 2
+            return True
+
+        candidate = start + 1
+        while candidate in seen or not is_prime(candidate):
+            candidate += 1
+        return candidate
+
+    def _engram_hash_layout(self) -> tuple[list[int], list[int], list[int]]:
+        hparams = self.hparams
+        layers = hparams["engram_layer_ids"]
+        ngram_count = hparams["engram_max_ngram_size"] - 1
+        head_count = hparams["engram_n_heads"]
+        seen: set[int] = set()
+        bucket_sizes: list[int] = []
+        offsets: list[int] = []
+
+        for _ in layers:
+            layer_sizes: list[int] = []
+            for _ in range(ngram_count):
+                current = hparams["engram_vocab_size"] - 1
+                for _ in range(head_count):
+                    current = self._find_next_prime(current, seen)
+                    seen.add(current)
+                    layer_sizes.append(current)
+            offset = 0
+            for size in layer_sizes:
+                offsets.append(offset)
+                bucket_sizes.append(size)
+                offset += size
+
+        max_i64 = np.iinfo(np.int64).max
+        bound = max(1, (max_i64 // hparams["engram_compressed_vocab_size"]) // 2)
+        multipliers: list[int] = []
+        for layer in layers:
+            generator = np.random.default_rng(10007 * layer)
+            values = generator.integers(0, bound, size=hparams["engram_max_ngram_size"], dtype=np.int64)
+            multipliers.extend(int(value) * 2 + 1 for value in values)
+
+        return multipliers, offsets, bucket_sizes
+
+    def _build_engram_token_map(self) -> np.ndarray:
+        if self._dsv41_token_map is not None:
+            return self._dsv41_token_map
+
+        from tokenizers import Regex, normalizers
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        sentinel = "\ue000"
+        normalizer = normalizers.Sequence([
+            normalizers.NFKC(),
+            normalizers.NFD(),
+            normalizers.StripAccents(),
+            normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+            normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(),
+            normalizers.Replace(sentinel, " "),
+        ])
+        backend = tokenizer.backend_tokenizer
+        key_to_id: dict[str, int] = {}
+        token_map = np.empty(len(tokenizer), dtype=np.int32)
+
+        for token_id in range(len(tokenizer)):
+            text = backend.decode([token_id], skip_special_tokens=False)
+            key = backend.id_to_token(token_id) if "\ufffd" in text else normalizer.normalize_str(text)
+            if not key:
+                key = text
+            token_map[token_id] = key_to_id.setdefault(key, len(key_to_id))
+
+        expected = self.hparams["engram_compressed_vocab_size"]
+        if len(key_to_id) != expected:
+            raise ValueError(f"Engram compressed vocab has {len(key_to_id)} entries, expected {expected}")
+        self._dsv41_token_map = token_map
+        return token_map
+
+    def set_gguf_parameters(self):
+        TextModel.set_gguf_parameters(self)
+        hparams = self.hparams
+
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
+        self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
+        self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
+        self.gguf_writer.add_swiglu_clamp_exp([hparams["swiglu_limit"]] * self.block_count)
+        self.gguf_writer.add_swiglu_clamp_shexp([hparams["swiglu_limit"]] * self.block_count)
+        self.gguf_writer.add_indexer_head_count(hparams["index_n_heads"])
+        self.gguf_writer.add_indexer_key_length(hparams["index_head_dim"])
+        self.gguf_writer.add_indexer_top_k(hparams["index_topk"])
+        self.gguf_writer.add_attention_output_group_count(hparams["o_groups"])
+        self.gguf_writer.add_attention_output_lora_rank(hparams["o_lora_rank"])
+        self.gguf_writer.add_attention_compress_ratios(hparams["compress_ratios"][:self.block_count])
+        self.gguf_writer.add_attention_compress_rope_freq_base(hparams["compress_rope_theta"])
+        self.gguf_writer.add_attention_kv_source_layers(hparams["kv_source_layer_ids"])
+        self.gguf_writer.add_indexer_source_layers(hparams["index_source_layer_ids"])
+        self.gguf_writer.add_indexer_candidate_source_layer(hparams["candidate_source_layer_id"])
+        self.gguf_writer.add_indexer_candidate_block_size(hparams["candidate_block_size"])
+        self.gguf_writer.add_indexer_candidate_top_k_blocks(hparams["candidate_topk_blocks"])
+        self.gguf_writer.add_hyper_connection_count(hparams["hc_mult"])
+        self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
+        self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
+        self.gguf_writer.add_embedding_length_out(hparams["hidden_size"])
+        self.gguf_writer.add_hash_layer_count(0)
+        self.gguf_writer.add_engram_layers(hparams["engram_layer_ids"])
+        self.gguf_writer.add_engram_max_ngram_size(hparams["engram_max_ngram_size"])
+        self.gguf_writer.add_engram_head_count(hparams["engram_n_heads"])
+        self.gguf_writer.add_engram_head_dim(hparams["engram_head_dim"])
+        self.gguf_writer.add_engram_pad_token_id(hparams["engram_pad_token_id"])
+        self.gguf_writer.add_engram_compressed_vocab_size(hparams["engram_compressed_vocab_size"])
+        self.gguf_writer.add_engram_table_rows(hparams["engram_num_embeddings"])
+        multipliers, offsets, bucket_sizes = self._engram_hash_layout()
+        self.gguf_writer.add_engram_hash_multipliers(multipliers)
+        self.gguf_writer.add_engram_head_offsets(offsets)
+        self.gguf_writer.add_engram_head_bucket_sizes(bucket_sizes)
+
+    def _engram_table(self, weight_name: str, scale_name: str) -> gguf.LazyChunkedTensor:
+        weight_shape = tuple(self.model_tensors[weight_name]().shape)
+        scale_shape = tuple(self.model_tensors[scale_name]().shape)
+        if len(weight_shape) != 2 or len(scale_shape) != 2:
+            raise ValueError(f"Expected 2D Engram tensors, got {weight_shape} and {scale_shape}")
+        if weight_shape[0] % scale_shape[0] != 0 or weight_shape[1] % scale_shape[1] != 0:
+            raise ValueError(f"Engram scale shape {scale_shape} does not divide weight shape {weight_shape}")
+        block_rows = weight_shape[0] // scale_shape[0]
+        block_cols = weight_shape[1] // scale_shape[1]
+        chunk_rows = 65536
+        chunks = []
+
+        for start in range(0, weight_shape[0], chunk_rows):
+            end = min(start + chunk_rows, weight_shape[0])
+
+            def load(start=start, end=end) -> np.ndarray:
+                weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]()[start:end])
+                scale_start = start // block_rows
+                scale_end = (end + block_rows - 1) // block_rows
+                scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]()[scale_start:scale_end])
+                scale_f = self._e8m0_to_float(scale).repeat_interleave(block_rows, 0)
+                scale_f = scale_f[start % block_rows:start % block_rows + end - start]
+                scale_f = scale_f.repeat_interleave(block_cols, 1)
+                return (weight.float() * scale_f).contiguous().numpy()
+
+            chunks.append(load)
+
+        return gguf.LazyChunkedTensor(chunks, weight_shape, np.float32)
+
+    def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_TENSOR, str]:
+        layer_map = {
+            "attn.indexer.wk.weight": gguf.MODEL_TENSOR.INDEXER_ATTN_K,
+            "attn.indexer.k_norm.weight": gguf.MODEL_TENSOR.INDEXER_K_NORM,
+            "engram.embed.weight": gguf.MODEL_TENSOR.ENGRAM_EMBD,
+            "engram.wkv.weight": gguf.MODEL_TENSOR.ENGRAM_WKV,
+            "engram.q_weight": gguf.MODEL_TENSOR.ENGRAM_Q,
+            "engram.k_weight": gguf.MODEL_TENSOR.ENGRAM_K,
+        }
+        match = re.match(r"layers\.(\d+)\.(.+)$", name)
+        if match is not None and match.group(2) in layer_map:
+            return layer_map[match.group(2)], ".weight"
+        return super()._map_dsv4_tensor_name(name, bid)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if ".engram.embed." in name:
+            if name.endswith(".scale"):
+                return []
+            if bid is None:
+                raise ValueError(f"Missing layer id for Engram tensor {name!r}")
+            scale_name = name.removesuffix(".weight") + ".scale"
+            if scale_name not in self.model_tensors:
+                raise KeyError(f"Missing Engram scale tensor {scale_name}")
+            table = self._engram_table(name, scale_name)
+            self._dsv41_engram_tables.add(name)
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid)
+            return [(new_name, cast(Any, table))]
+        return super().modify_tensors(data_torch, name, bid)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+        self.gguf_writer.add_engram_token_map(self._build_engram_token_map().tolist())
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if name in self._dsv41_engram_tables:
+            return gguf.GGMLQuantizationType.Q8_0
+        if name.endswith((".engram.q_weight", ".engram.k_weight")):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
 @ModelBase.register("DeepseekV4DSparkModel")

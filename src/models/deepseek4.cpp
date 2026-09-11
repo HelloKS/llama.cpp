@@ -263,6 +263,51 @@ static dsv4_state_tensors dsv4_build_state_snapshot(
     return { kv, score };
 }
 
+ggml_tensor * llama_model_deepseek4::graph::build_compressed_latent(
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_dsv4_comp_state * state,
+        ggml_tensor * kv,
+        ggml_tensor * score,
+        ggml_tensor * norm,
+        int il) const {
+    const auto restored = dsv4_build_state_restore(ctx0, inp, state, il);
+    const int64_t dim = kv->ne[0];
+    ggml_tensor * source_kv = ggml_concat(ctx0,
+            dsv4_view_2d(ctx0, restored.kv, dim, state->get_n_rows(), 0), kv, 1);
+    ggml_tensor * source_score = ggml_concat(ctx0,
+            dsv4_view_2d(ctx0, restored.score, dim, state->get_n_rows(), 0), score, 1);
+
+    ggml_tensor * latent = nullptr;
+    if (inp.state_write_idxs) {
+        const int64_t blocks = inp.state_write_idxs->ne[0];
+        const int64_t ratio = state->get_ratio();
+        ggml_tensor * values = ggml_get_rows(ctx0, source_kv, inp.state_read_idxs);
+        ggml_tensor * scores = ggml_get_rows(ctx0, source_score, inp.state_read_idxs);
+        values = ggml_reshape_3d(ctx0, values, dim, ratio, blocks);
+        scores = ggml_reshape_3d(ctx0, scores, dim, ratio, blocks);
+        values = ggml_cont(ctx0, ggml_permute(ctx0, values, 1, 0, 2, 3));
+        scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
+        latent = ggml_sum_rows(ctx0, ggml_mul(ctx0, values, ggml_soft_max(ctx0, scores)));
+        latent = ggml_cont(ctx0, ggml_permute(ctx0, latent, 1, 0, 2, 3));
+        latent = build_norm(latent, norm, nullptr, LLM_NORM_RMS, il);
+        ggml_build_forward_expand(gf, latent);
+    }
+
+    const auto snapshot = dsv4_build_state_snapshot(ctx0, inp, state,
+            ggml_concat(ctx0, restored.kv, kv, 1), ggml_concat(ctx0, restored.score, score, 1), il);
+    if (snapshot.kv) {
+        ggml_build_forward_expand(gf, snapshot.kv);
+        ggml_build_forward_expand(gf, snapshot.score);
+    }
+    if (inp.state_persist_src_idxs) {
+        ggml_build_forward_expand(gf, state->cpy_kv(ctx0,
+                ggml_get_rows(ctx0, kv, inp.state_persist_src_idxs), inp.state_persist_dst_idxs, il));
+        ggml_build_forward_expand(gf, state->cpy_score(ctx0,
+                ggml_get_rows(ctx0, score, inp.state_persist_src_idxs), inp.state_persist_dst_idxs, il));
+    }
+    return latent;
+}
+
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
@@ -358,7 +403,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor * hc_base,
         ggml_tensor ** post,
         ggml_tensor ** comb,
-        int il) const {
+        int il,
+        ggml_tensor ** pre_out) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
     const int64_t hc_mix_dim = (2 + hc)*hc;
@@ -384,6 +430,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_pre", il);
 
+    if (pre_out != nullptr) {
+        *pre_out = pre;
+    }
+
     *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
     *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
     *post = ggml_sigmoid(ctx0, *post);
@@ -405,6 +455,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     }
     cb(*comb, "hc_comb", il);
 
+    if (pre_out != nullptr) {
+        return nullptr;
+    }
     ggml_tensor * result = build_hc_pre(x, pre, il);
     return result;
 }

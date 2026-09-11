@@ -1178,6 +1178,8 @@ struct llama_model_dots3note : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+class llama_dsv4_comp_state;
+
 struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1194,7 +1196,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_base,
                 ggml_tensor ** post,
                 ggml_tensor ** comb,
-                int il) const;
+                int il,
+                ggml_tensor ** pre_out = nullptr) const;
 
         ggml_tensor * build_hc_post(
                 ggml_tensor * x,
@@ -1229,6 +1232,14 @@ struct llama_model_deepseek4 : public llama_model_base {
                 llm_graph_input_attn_k_iswa * inp_mtp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                int il) const;
+
+        ggml_tensor * build_compressed_latent(
+                const llm_graph_input_dsv4::comp_input & inp,
+                const llama_dsv4_comp_state * state,
+                ggml_tensor * kv,
+                ggml_tensor * score,
+                ggml_tensor * norm,
                 int il) const;
 
         ggml_tensor * build_hca_compressed_kv_from_state(
@@ -1308,6 +1319,26 @@ struct llama_model_deepseek4 : public llama_model_base {
 
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_deepseek41 : public llama_model_deepseek4 {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_attention41(const llama_model & model, llm_graph_input_dsv4 * inp,
+                ggml_tensor * cur, ggml_tensor * inp_pos, int il);
+
+        int kv_source = -1;
+        ggml_tensor * index_mask = nullptr;
+        ggml_tensor * candidate_mask = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

@@ -814,6 +814,21 @@ class GGUFWriter:
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 
+    def add_attention_kv_source_layers(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.KV_SOURCE_LAYERS.format(arch=self.arch), values)
+
+    def add_indexer_source_layers(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.Indexer.SOURCE_LAYERS.format(arch=self.arch), values)
+
+    def add_indexer_candidate_source_layer(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_SOURCE_LAYER.format(arch=self.arch), value)
+
+    def add_indexer_candidate_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_indexer_candidate_top_k_blocks(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_TOP_K_BLOCKS.format(arch=self.arch), value)
+
     def add_indexer_block_size(self, block_size: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.BLOCK_SIZE.format(arch=self.arch), block_size)
 
@@ -1082,6 +1097,39 @@ class GGUFWriter:
 
     def add_ple_layer_multipliers(self, values: Sequence[int]) -> None:
         self._add_u64_array(Keys.PerLayerEmbedding.LAYER_MULTIPLIERS.format(arch=self.arch), values)
+
+    def add_engram_layers(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.LAYERS.format(arch=self.arch), values)
+
+    def add_engram_max_ngram_size(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.MAX_NGRAM_SIZE.format(arch=self.arch), value)
+
+    def add_engram_head_count(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.HEAD_COUNT.format(arch=self.arch), value)
+
+    def add_engram_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.HEAD_DIM.format(arch=self.arch), value)
+
+    def add_engram_pad_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.PAD_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_engram_compressed_vocab_size(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.COMPRESSED_VOCAB_SIZE.format(arch=self.arch), value)
+
+    def add_engram_token_map(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.TOKEN_MAP.format(arch=self.arch), values)
+
+    def add_engram_table_rows(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Engram.TABLE_ROWS.format(arch=self.arch), values)
+
+    def add_engram_hash_multipliers(self, values: Sequence[int]) -> None:
+        self._add_u64_array(Keys.Engram.HASH_MULTIPLIERS.format(arch=self.arch), values)
+
+    def add_engram_head_offsets(self, values: Sequence[int]) -> None:
+        self._add_u64_array(Keys.Engram.HEAD_OFFSETS.format(arch=self.arch), values)
+
+    def add_engram_head_bucket_sizes(self, values: Sequence[int]) -> None:
+        self._add_u64_array(Keys.Engram.HEAD_BUCKET_SIZES.format(arch=self.arch), values)
 
     def add_ple_head_offsets(self, values: Sequence[int]) -> None:
         self._add_u64_array(Keys.PerLayerEmbedding.HEAD_OFFSETS.format(arch=self.arch), values)

@@ -319,6 +319,53 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,             hparams.hc_low_rank);
 
+    if (model->arch == LLM_ARCH_DEEPSEEK41) {
+        std::vector<uint32_t> kv_sources;
+        std::vector<uint32_t> index_sources;
+        std::vector<uint32_t> engram_layers;
+        std::vector<uint32_t> table_rows;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.dsv41_kv_sources.test(il)) {
+                kv_sources.push_back(il);
+            }
+            if (hparams.dsv41_index_sources.test(il)) {
+                index_sources.push_back(il);
+            }
+            if (hparams.dsv41_engram_layers.test(il)) {
+                engram_layers.push_back(il);
+                table_rows.push_back(hparams.dsv41_engram_table_rows[il]);
+            }
+        }
+        const uint32_t hash_heads        = (hparams.dsv41_engram_max_ngram_size - 1) * hparams.dsv41_engram_head_count;
+        const uint32_t total_hash_heads  = hash_heads * hparams.dsv41_engram_layer_count;
+        const uint32_t total_multipliers = hparams.dsv41_engram_max_ngram_size * hparams.dsv41_engram_layer_count;
+        const std::vector<uint64_t> multipliers(
+                hparams.dsv41_engram_hash_multipliers.begin(), hparams.dsv41_engram_hash_multipliers.begin() + total_multipliers);
+        std::vector<uint64_t> offsets(total_hash_heads);
+        std::vector<uint64_t> bucket_sizes(total_hash_heads);
+        for (uint32_t i = 0; i < total_hash_heads; ++i) {
+            offsets[i]      = hparams.dsv41_engram_head_offsets[i];
+            bucket_sizes[i] = hparams.dsv41_engram_head_bucket_sizes[i];
+        }
+
+        add_kv(LLM_KV_ATTENTION_KV_SOURCE_LAYERS, kv_sources);
+        add_kv(LLM_KV_ATTENTION_INDEXER_SOURCE_LAYERS, index_sources);
+        add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, hparams.dsv41_candidate_source_layer);
+        add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE, hparams.dsv41_candidate_block_size);
+        add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.dsv41_candidate_top_k_blocks);
+        add_kv(LLM_KV_ENGRAM_LAYERS, engram_layers);
+        add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.dsv41_engram_max_ngram_size);
+        add_kv(LLM_KV_ENGRAM_HEAD_COUNT, hparams.dsv41_engram_head_count);
+        add_kv(LLM_KV_ENGRAM_HEAD_DIM, hparams.dsv41_engram_head_dim);
+        add_kv(LLM_KV_ENGRAM_PAD_TOKEN_ID, hparams.dsv41_engram_pad_token_id);
+        add_kv(LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE, hparams.dsv41_engram_compressed_vocab_size);
+        add_kv(LLM_KV_ENGRAM_TABLE_ROWS, table_rows);
+        add_kv(LLM_KV_ENGRAM_HASH_MULTIPLIERS, multipliers);
+        add_kv(LLM_KV_ENGRAM_HEAD_OFFSETS, offsets);
+        add_kv(LLM_KV_ENGRAM_HEAD_BUCKET_SIZES, bucket_sizes);
+        add_kv(LLM_KV_ENGRAM_TOKEN_MAP, model->engram_token_map);
+    }
+
     // the PLE group only means anything whole: write all of it or none
     if (hparams.ple_n_heads > 0) {
         std::vector<uint32_t> ple_layers;

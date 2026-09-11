@@ -204,6 +204,7 @@ class Keys:
         OUTPUT_SCALE                 = "{arch}.attention.output_scale"
         VALUE_SCALE                  = "{arch}.attention.value_scale"
         COMPRESS_RATIOS              = "{arch}.attention.compress_ratios"
+        KV_SOURCE_LAYERS             = "{arch}.attention.kv_source_layers"
         COMPRESS_ROPE_FREQ_BASE      = "{arch}.attention.compress_rope_freq_base"
         TEMPERATURE_LENGTH           = "{arch}.attention.temperature_length"
         KEY_LENGTH_MLA               = "{arch}.attention.key_length_mla"
@@ -220,9 +221,13 @@ class Keys:
         ROPE_PATTERN                 = "{arch}.attention.rope_pattern"
 
         class Indexer:
-            HEAD_COUNT = "{arch}.attention.indexer.head_count"
-            KEY_LENGTH = "{arch}.attention.indexer.key_length"
-            TOP_K      = "{arch}.attention.indexer.top_k"
+            HEAD_COUNT             = "{arch}.attention.indexer.head_count"
+            KEY_LENGTH             = "{arch}.attention.indexer.key_length"
+            TOP_K                  = "{arch}.attention.indexer.top_k"
+            SOURCE_LAYERS          = "{arch}.attention.indexer.source_layers"
+            CANDIDATE_SOURCE_LAYER = "{arch}.attention.indexer.candidate_source_layer"
+            CANDIDATE_BLOCK_SIZE   = "{arch}.attention.indexer.candidate_block_size"
+            CANDIDATE_TOP_K_BLOCKS = "{arch}.attention.indexer.candidate_top_k_blocks"
             BLOCK_SIZE   = "{arch}.attention.indexer.block_size"    # MSA
             LOCAL_BLOCKS = "{arch}.attention.indexer.local_blocks"  # MSA
             TYPES      = "{arch}.attention.indexer.types"
@@ -246,6 +251,19 @@ class Keys:
         HEAD_VOCAB_SIZES   = "{arch}.ple.head_vocab_sizes"
         EOS_TOKEN_ID       = "{arch}.ple.eos_token_id"
         IMAGE_TOKEN_ID     = "{arch}.ple.image_token_id"
+
+    class Engram:
+        LAYERS                = "{arch}.engram.layers"
+        MAX_NGRAM_SIZE        = "{arch}.engram.max_ngram_size"
+        HEAD_COUNT            = "{arch}.engram.head_count"
+        HEAD_DIM              = "{arch}.engram.head_dim"
+        PAD_TOKEN_ID          = "{arch}.engram.pad_token_id"
+        COMPRESSED_VOCAB_SIZE = "{arch}.engram.compressed_vocab_size"
+        TOKEN_MAP             = "{arch}.engram.token_map"
+        TABLE_ROWS            = "{arch}.engram.table_rows"
+        HASH_MULTIPLIERS      = "{arch}.engram.hash_multipliers"
+        HEAD_OFFSETS          = "{arch}.engram.head_offsets"
+        HEAD_BUCKET_SIZES     = "{arch}.engram.head_bucket_sizes"
 
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
@@ -558,6 +576,7 @@ class MODEL_ARCH(IntEnum):
     DEEPSEEK2OCR     = auto()
     DEEPSEEK32       = auto()
     DEEPSEEK4        = auto()
+    DEEPSEEK41       = auto()
     CHATGLM          = auto()
     GLM4             = auto()
     GLM4_MOE         = auto()
@@ -822,6 +841,10 @@ class MODEL_TENSOR(IntEnum):
     PLE_NORM_QUERY       = auto() # qwen4exp
     PLE_NORM_CONV        = auto() # qwen4exp
     PLE_CONV1D           = auto() # qwen4exp
+    ENGRAM_EMBD          = auto() # deepseek41
+    ENGRAM_WKV           = auto() # deepseek41
+    ENGRAM_Q             = auto() # deepseek41
+    ENGRAM_K             = auto() # deepseek41
     ATTN_COMPRESSOR_WKV  = auto()
     ATTN_COMPRESSOR_WGATE = auto()
     ATTN_COMPRESSOR_APE  = auto()
@@ -1312,6 +1335,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
     MODEL_ARCH.DEEPSEEK32:       "deepseek32",
     MODEL_ARCH.DEEPSEEK4:        "deepseek4",
+    MODEL_ARCH.DEEPSEEK41:       "deepseek41",
     MODEL_ARCH.CHATGLM:          "chatglm",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
@@ -1575,6 +1599,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.PLE_NORM_QUERY:            "blk.{bid}.ple_norm_query",       # qwen4exp
     MODEL_TENSOR.PLE_NORM_CONV:             "blk.{bid}.ple_norm_conv",        # qwen4exp
     MODEL_TENSOR.PLE_CONV1D:                "blk.{bid}.ple_conv1d",           # qwen4exp
+    MODEL_TENSOR.ENGRAM_EMBD:               "blk.{bid}.engram_embd",          # deepseek41
+    MODEL_TENSOR.ENGRAM_WKV:                "blk.{bid}.engram_wkv",           # deepseek41
+    MODEL_TENSOR.ENGRAM_Q:                  "blk.{bid}.engram_q",             # deepseek41
+    MODEL_TENSOR.ENGRAM_K:                  "blk.{bid}.engram_k",             # deepseek41
     MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_kv",
     MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_gate",
     MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
@@ -3903,6 +3931,48 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HNORM,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+    ],
+    MODEL_ARCH.DEEPSEEK41: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV,
+        MODEL_TENSOR.ATTN_KV_NORM,
+        MODEL_TENSOR.ATTN_OUT_A,
+        MODEL_TENSOR.ATTN_OUT_B,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_WKV,
+        MODEL_TENSOR.ATTN_COMPRESSOR_WGATE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_NORM,
+        MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.INDEXER_ATTN_K,
+        MODEL_TENSOR.INDEXER_K_NORM,
+        MODEL_TENSOR.ENGRAM_EMBD,
+        MODEL_TENSOR.ENGRAM_WKV,
+        MODEL_TENSOR.ENGRAM_Q,
+        MODEL_TENSOR.ENGRAM_K,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_TID2EID,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_EXP_PROBS_B_VL,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
     ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,

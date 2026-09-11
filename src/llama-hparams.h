@@ -294,6 +294,24 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    std::bitset<LLAMA_MAX_LAYERS> dsv41_kv_sources;
+    std::bitset<LLAMA_MAX_LAYERS> dsv41_index_sources;
+    uint32_t                      dsv41_candidate_source_layer = 0;
+    uint32_t                      dsv41_candidate_block_size   = 0;
+    uint32_t                      dsv41_candidate_top_k_blocks = 0;
+
+    std::bitset<LLAMA_MAX_LAYERS>             dsv41_engram_layers;
+    uint32_t                                  dsv41_engram_layer_count           = 0;
+    uint32_t                                  dsv41_engram_max_ngram_size        = 0;
+    uint32_t                                  dsv41_engram_head_count            = 0;
+    uint32_t                                  dsv41_engram_head_dim              = 0;
+    uint32_t                                  dsv41_engram_pad_token_id          = 0;
+    uint32_t                                  dsv41_engram_compressed_vocab_size = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS>    dsv41_engram_table_rows;
+    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> dsv41_engram_hash_multipliers;
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS> dsv41_engram_head_offsets;
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS> dsv41_engram_head_bucket_sizes;
+
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
 

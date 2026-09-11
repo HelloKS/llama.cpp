@@ -520,6 +520,12 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
 
+    // DeepSeek-V4.1
+    struct ggml_tensor * engram_embd = nullptr;
+    struct ggml_tensor * engram_wkv  = nullptr;
+    struct ggml_tensor * engram_q    = nullptr;
+    struct ggml_tensor * engram_k    = nullptr;
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
@@ -647,6 +653,9 @@ struct llama_model {
     struct ggml_tensor * hc_head_fn    = nullptr;
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
+
+    // DeepSeek-V4.1
+    std::vector<uint32_t> engram_token_map;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
