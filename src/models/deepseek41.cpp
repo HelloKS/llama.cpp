@@ -426,12 +426,28 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_tensor * weights = build_lora_mm(layer.indexer_proj, cur);
             weights = ggml_scale(ctx0, weights, 1.0f / sqrtf(float(index_dim * index_heads)));
             weights = ggml_reshape_4d(ctx0, weights, index_heads, nt / ns, 1, ns);
-            ggml_tensor * scores = ggml_mul_mat(ctx0,
-                    ggml_permute(ctx0, ik, 0, 2, 1, 3), ggml_permute(ctx0, iq, 0, 2, 1, 3));
-            scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 2, 1, 0, 3));
-            scores = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, scores), weights));
-            scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 2, 1, 0, 3));
-            scores = ggml_add(ctx0, scores, ggml_cast(ctx0, comp.kq_mask, GGML_TYPE_F32));
+
+            ggml_tensor * score_mask = comp.kq_mask;
+            if ((uint32_t) il > hparams.dsv41_candidate_source_layer) {
+                GGML_ASSERT(candidate_mask);
+                score_mask = ggml_add(ctx0, score_mask, candidate_mask);
+            }
+
+            ggml_tensor * scores = nullptr;
+            if (cparams.fused_lid) {
+                score_mask = ggml_cast(ctx0, score_mask, GGML_TYPE_F16);
+                scores = ggml_lightning_indexer(ctx0, iq, ik, weights, score_mask);
+                cb(scores, "index_score_masked", il);
+                res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, scores, il});
+            } else {
+                scores = ggml_mul_mat(ctx0,
+                        ggml_permute(ctx0, ik, 0, 2, 1, 3), ggml_permute(ctx0, iq, 0, 2, 1, 3));
+                scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 2, 1, 0, 3));
+                scores = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, scores), weights));
+                scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 2, 1, 0, 3));
+                scores = ggml_add(ctx0, scores, ggml_cast(ctx0, score_mask, GGML_TYPE_F32));
+                cb(scores, "index_score_masked", il);
+            }
 
             if (candidate_source) {
                 const int64_t block_size = hparams.dsv41_candidate_block_size;
@@ -447,9 +463,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 mask = ggml_reshape_4d(ctx0, mask, 1, blocks, nt / ns, ns);
                 mask = ggml_repeat_4d(ctx0, mask, block_size, blocks, nt / ns, ns);
                 candidate_mask = ggml_reshape_4d(ctx0, mask, count, nt / ns, 1, ns);
-            } else if ((uint32_t) il > hparams.dsv41_candidate_source_layer) {
-                GGML_ASSERT(candidate_mask);
-                scores = ggml_add(ctx0, scores, ggml_cast(ctx0, candidate_mask, GGML_TYPE_F32));
             }
             ggml_tensor * selected = ggml_cont(ctx0, ggml_top_k(ctx0, scores,
                     std::min<int64_t>(count, hparams.indexer_top_k)));
@@ -469,7 +482,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_build_forward_expand(gf, raw->mctx->cpy_k(ctx0, kv, raw->get_k_idxs(), il));
         ggml_tensor * keys = ggml_concat(ctx0, raw->mctx->get_k(ctx0, il), slice_k(cache->get_k(ctx0, kv_source), count), 2);
         ggml_tensor * mask = ggml_concat(ctx0, raw->get_kq_mask(), index_mask, 0);
-        out = build_attn_mha(q, keys, keys, nullptr, mask, layer.attn_sinks, nullptr, 0, 1.0f / sqrtf(float(dim)), il);
+        const int64_t n_kv_max = std::min<int64_t>(raw->get_kq_mask()->ne[0], hparams.n_swa) +
+                                 std::min<int64_t>(count, hparams.indexer_top_k);
+        out = build_attn_mha(q, keys, keys, nullptr, mask, layer.attn_sinks, nullptr,
+                n_kv_max, 1.0f / sqrtf(float(dim)), il);
         if (raw->self_k_rot) {
             out = llama_mul_mat_hadamard(ctx0, out, raw->self_k_rot);
         }
