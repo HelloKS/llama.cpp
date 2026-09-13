@@ -3,6 +3,27 @@
 #include "fattn-common.cuh"
 #include "convert.cuh"
 
+template <int K_VECS_PER_BLOCK>
+static __device__ bool lightning_indexer_skip_masked(
+        const half * M, float * dst, int64_t n_kv, size_t nb1, size_t nb3,
+        size_t nbm1, size_t nbm3, int64_t nem3) {
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int i_kv = blockIdx.x * K_VECS_PER_BLOCK + tid;
+    const bool valid = tid < K_VECS_PER_BLOCK && i_kv < n_kv;
+    const half * mask = (const half *) ((const char *) M + blockIdx.y*nbm1 + (blockIdx.z%nem3)*nbm3);
+    const bool active = valid && __half2float(mask[i_kv]) != -INFINITY;
+
+    // Keep the whole block together before the matrix kernel's barriers.
+    if (__syncthreads_count(active) != 0) {
+        return false;
+    }
+    if (valid) {
+        float * out = (float *) ((char *) dst + blockIdx.y*nb1 + blockIdx.z*nb3);
+        out[i_kv] = -INFINITY;
+    }
+    return true;
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
 
@@ -40,6 +61,10 @@ static __global__ void lightning_indexer_kernel_wmma(
 
     // each block processes K_VECS_PER_BLOCK K vectors
     const int start_kv = blockIdx.x * K_VECS_PER_BLOCK;
+
+    if (lightning_indexer_skip_masked<K_VECS_PER_BLOCK>(M, dst, n_kv, nb1, nb3, nbm1, nbm3, nem3)) {
+        return;
+    }
 
     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
@@ -264,6 +289,10 @@ static __global__ void lightning_indexer_kernel_vec(
     // each warp processes K_VECS_PER_WARP K vectors
     const int start_kv_block = blockIdx.x * K_VECS_PER_BLOCK;
     const int start_kv = start_kv_block + i_warp * K_VECS_PER_WARP;
+
+    if (lightning_indexer_skip_masked<K_VECS_PER_BLOCK>(M, dst, n_kv, nb1, nb3, nbm1, nbm3, nem3)) {
+        return;
+    }
 
     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);

@@ -53,6 +53,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    uint32_t dsv41_replay = 0;
+    bool dsv41_replay_features = false;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

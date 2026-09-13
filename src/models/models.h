@@ -1334,8 +1334,11 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         graph(const llama_model & model, const llm_graph_params & params);
 
         ggml_tensor * build_attention41(const llama_model & model, llm_graph_input_dsv4 * inp,
-                ggml_tensor * cur, ggml_tensor * inp_pos, int il);
+                ggml_tensor * cur, ggml_tensor * inp_pos, int il, bool kv_only = false);
 
+        uint32_t replay_skip = 0;
+        ggml_tensor * replay_mask = nullptr;
+        ggml_tensor * replay_k_idxs = nullptr;
         int kv_source = -1;
         ggml_tensor * index_mask = nullptr;
         ggml_tensor * candidate_mask = nullptr;

@@ -302,10 +302,69 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
     const uint32_t                 module;
 };
 
+static uint32_t dsv41_replay_skip(const llm_graph_params & params) {
+    const auto & batch = params.ubatch;
+    const auto & hp = params.hparams;
+    const uint64_t window = uint64_t(params.cparams.dsv41_replay) + params.cparams.n_rs_seq;
+    if (!params.cparams.dsv41_replay || batch.n_tokens <= window || batch.n_seqs_unq != 1 || batch.n_pos != 1 ||
+        hp.dsv41_candidate_source_layer != hp.n_layer()/2 || params.cparams.embeddings ||
+        !hp.dsv41_kv_sources.test(hp.dsv41_candidate_source_layer) || hp.dsv4_compress_ratios[hp.dsv41_candidate_source_layer] != 1) {
+        return 0;
+    }
+    uint32_t skip = batch.n_tokens - window;
+    if (!params.cparams.dsv41_replay_features &&
+        std::any_of(params.cparams.embeddings_layer_inp.begin(), params.cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; })) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || (i && batch.pos[i] != batch.pos[i - 1] + 1)) {
+            return 0;
+        }
+        if (batch.output && batch.output[i]) {
+            skip = std::min(skip, i);
+        }
+    }
+    for (uint32_t il = hp.dsv41_candidate_source_layer + 1; il < hp.n_layer(); ++il) {
+        if (hp.dsv41_kv_sources.test(il) || hp.dsv41_engram_layers.test(il)) {
+            return 0;
+        }
+    }
+    return skip;
+}
+
+class llm_graph_input_dsv41_replay : public llm_graph_input_i {
+public:
+    llm_graph_input_dsv41_replay(const llm_graph_params & params) :
+        mctx(static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw()),
+        skip(dsv41_replay_skip(params)) {}
+
+    void set_input(const llama_ubatch * batch) override {
+        if (!mask) {
+            return;
+        }
+        auto tail = *batch;
+        tail.n_tokens -= skip;
+        tail.n_seq_tokens = tail.n_tokens;
+        tail.pos += skip;
+        tail.n_seq_id += skip;
+        tail.seq_id += skip;
+        mctx->set_input_kq_mask(mask, &tail, true, tail.pos[0]);
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
+        return skip == dsv41_replay_skip(params);
+    }
+
+    const llama_kv_cache_dsv4_raw_context * mctx;
+    const uint32_t skip;
+    ggml_tensor * mask = nullptr;
+};
+
 class llm_graph_input_dsv41_index : public llm_graph_input_i {
   public:
-    llm_graph_input_dsv41_index(const llama_kv_cache_dsv4_context * mctx, uint32_t ratio, uint32_t block_size) :
-        mctx(mctx), ratio(ratio), block_size(block_size) {}
+    llm_graph_input_dsv41_index(const llama_kv_cache_dsv4_context * mctx, uint32_t ratio, uint32_t block_size, uint32_t skip = 0) :
+        mctx(mctx), ratio(ratio), block_size(block_size), skip(skip) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         const auto & plan = ratio == 2 ? mctx->get_csa_plan(*ubatch) : mctx->get_hca_plan(*ubatch);
@@ -320,11 +379,11 @@ class llm_graph_input_dsv41_index : public llm_graph_input_i {
         }
         if (latest_block) {
             const int64_t blocks = latest_block->ne[0];
-            std::vector<float> bias(blocks * ubatch->n_tokens, 0.0f);
-            for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            std::vector<float> bias(blocks * (ubatch->n_tokens - skip), 0.0f);
+            for (uint32_t i = skip; i < ubatch->n_tokens; ++i) {
                 const int64_t visible = (ubatch->pos[i] + 1) / ratio;
                 if (visible > 0) {
-                    bias[i * blocks + (visible - 1) / block_size] = INFINITY;
+                    bias[(i - skip) * blocks + (visible - 1) / block_size] = INFINITY;
                 }
             }
             ggml_backend_tensor_set(latest_block, bias.data(), 0, bias.size() * sizeof(float));
@@ -336,19 +395,20 @@ class llm_graph_input_dsv41_index : public llm_graph_input_i {
         const auto & plan = ratio == 2 ? mctx->get_csa_plan(params.ubatch) : mctx->get_hca_plan(params.ubatch);
         return (!write_idxs || write_idxs->ne[0] == (int64_t) plan.state_write_idxs.size()) &&
             (!latest_block || (latest_block->ne[0] == plan.n_kv / block_size &&
-                latest_block->ne[1] == params.ubatch.n_tokens / plan.n_stream && latest_block->ne[3] == plan.n_stream));
+                latest_block->ne[1] == (params.ubatch.n_tokens - skip) / plan.n_stream && latest_block->ne[3] == plan.n_stream));
     }
 
     const llama_kv_cache_dsv4_context * mctx;
     const uint32_t ratio;
     const uint32_t block_size;
+    const uint32_t skip;
     ggml_tensor * write_idxs = nullptr;
     ggml_tensor * latest_block = nullptr;
 };
 
 ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const llama_model & model, llm_graph_input_dsv4 * inp,
-        ggml_tensor * cur, ggml_tensor * inp_pos, int il) {
+        ggml_tensor * cur, ggml_tensor * inp_pos, int il, bool kv_only) {
     const auto & layer = model.layers[il];
     const int64_t dim = hparams.n_embd_head_k();
     const int64_t nt = cur->ne[1];
@@ -368,11 +428,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         return ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], count, k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
     };
 
-    ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-    ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), dim, n_head, nt);
-    q = rope(q, inp_pos);
-    ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
-    kv = rope(ggml_reshape_3d(ctx0, kv, dim, 1, nt), inp_pos);
+    ggml_tensor * qr = nullptr;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * kv = nullptr;
+    if (!kv_only) {
+        qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        q = rope(ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), dim, n_head, nt), inp_pos);
+        kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+        kv = rope(ggml_reshape_3d(ctx0, kv, dim, 1, nt), inp_pos);
+    }
 
     ggml_tensor * out = nullptr;
     if (ratio == 0) {
@@ -386,9 +450,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const int64_t ns = comp.kq_mask->ne[3];
         const int64_t index_dim = hparams.indexer_head_size;
         const int64_t index_heads = hparams.indexer_n_head;
-        const bool owns_kv = hparams.dsv41_kv_sources.test(il);
+        const bool owns_kv = hparams.dsv41_kv_sources.test(il) && !(replay_skip && kv_source == il);
         const bool candidate_source = (uint32_t) il == hparams.dsv41_candidate_source_layer;
-        auto aux = std::make_unique<llm_graph_input_dsv41_index>(inp->mctx, ratio, hparams.dsv41_candidate_block_size);
+        auto aux = std::make_unique<llm_graph_input_dsv41_index>(inp->mctx, ratio, hparams.dsv41_candidate_block_size, replay_skip);
 
         if (owns_kv) {
             kv_source = il;
@@ -415,7 +479,27 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             }
         }
 
-        if (hparams.dsv41_index_sources.test(il)) {
+        if (kv_only) {
+            if (aux->write_idxs) {
+                res->add_input(std::move(aux));
+            }
+            return nullptr;
+        }
+        ggml_tensor * comp_mask = comp.kq_mask;
+        if (replay_skip) {
+            comp_mask = ggml_view_4d(ctx0, comp_mask, count, nt, 1, 1,
+                    comp_mask->nb[1], comp_mask->nb[2], comp_mask->nb[3], replay_skip*comp_mask->nb[1]);
+        }
+
+        const bool index_all = count <= hparams.indexer_top_k &&
+            ((uint32_t) il < hparams.dsv41_candidate_source_layer ||
+             count / hparams.dsv41_candidate_block_size <= hparams.dsv41_candidate_top_k_blocks);
+        if (hparams.dsv41_index_sources.test(il) && index_all) {
+            index_mask = comp_mask;
+            if (candidate_source) {
+                candidate_mask = ggml_fill(ctx0, comp_mask, 0.0f);
+            }
+        } else if (hparams.dsv41_index_sources.test(il)) {
             ggml_tensor * iq = build_lora_mm(layer.indexer_attn_q_b, qr);
             iq = rope(ggml_reshape_3d(ctx0, iq, index_dim, index_heads, nt), inp_pos);
             if (inp->get_lid().k_rot) {
@@ -427,7 +511,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             weights = ggml_scale(ctx0, weights, 1.0f / sqrtf(float(index_dim * index_heads)));
             weights = ggml_reshape_4d(ctx0, weights, index_heads, nt / ns, 1, ns);
 
-            ggml_tensor * score_mask = comp.kq_mask;
+            ggml_tensor * score_mask = comp_mask;
             if ((uint32_t) il > hparams.dsv41_candidate_source_layer) {
                 GGML_ASSERT(candidate_mask);
                 score_mask = ggml_add(ctx0, score_mask, candidate_mask);
@@ -458,7 +542,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 block_scores = ggml_add(ctx0, block_scores, aux->latest_block);
                 ggml_tensor * selected = ggml_cont(ctx0, ggml_top_k(ctx0, block_scores,
                         std::min<int64_t>(blocks, hparams.dsv41_candidate_top_k_blocks)));
-                ggml_tensor * mask = ggml_fill(ctx0, ggml_cast(ctx0, block_scores, comp.kq_mask->type), 0.0f);
+                ggml_tensor * mask = ggml_fill(ctx0, ggml_cast(ctx0, block_scores, comp_mask->type), 0.0f);
                 mask = build_top_k_mask(mask, selected, "index_candidate_blocks", il);
                 mask = ggml_reshape_4d(ctx0, mask, 1, blocks, nt / ns, ns);
                 mask = ggml_repeat_4d(ctx0, mask, block_size, blocks, nt / ns, ns);
@@ -466,7 +550,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             }
             ggml_tensor * selected = ggml_cont(ctx0, ggml_top_k(ctx0, scores,
                     std::min<int64_t>(count, hparams.indexer_top_k)));
-            index_mask = build_top_k_mask(comp.kq_mask, selected, "index_top_k_mask", il);
+            index_mask = build_top_k_mask(comp_mask, selected, "index_top_k_mask", il);
         }
         if (aux->write_idxs || aux->latest_block) {
             res->add_input(std::move(aux));
@@ -479,10 +563,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             kv = llama_mul_mat_hadamard(ctx0, kv, raw->self_k_rot);
         }
         ggml_build_forward_expand(gf, q);
-        ggml_build_forward_expand(gf, raw->mctx->cpy_k(ctx0, kv, raw->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, raw->mctx->cpy_k(ctx0, kv, (replay_skip ? replay_k_idxs : raw->get_k_idxs()), il));
         ggml_tensor * keys = ggml_concat(ctx0, raw->mctx->get_k(ctx0, il), slice_k(cache->get_k(ctx0, kv_source), count), 2);
-        ggml_tensor * mask = ggml_concat(ctx0, raw->get_kq_mask(), index_mask, 0);
-        const int64_t n_kv_max = std::min<int64_t>(raw->get_kq_mask()->ne[0], hparams.n_swa) +
+        ggml_tensor * mask = ggml_concat(ctx0, (replay_skip ? replay_mask : raw->get_kq_mask()), index_mask, 0);
+        const int64_t n_kv_max = std::min<int64_t>((replay_skip ? replay_mask : raw->get_kq_mask())->ne[0], hparams.n_swa) +
                                  std::min<int64_t>(count, hparams.indexer_top_k);
         out = build_attn_mha(q, keys, keys, nullptr, mask, layer.attn_sinks, nullptr,
                 n_kv_max, 1.0f / sqrtf(float(dim)), il);
@@ -518,6 +602,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     ggml_tensor * zero    = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f);
     ggml_tensor * pre_mix = ggml_concat(ctx0, one, zero, 0);
 
+    auto replay = std::make_unique<llm_graph_input_dsv41_replay>(params);
+    const uint32_t skip = replay->skip;
+    const auto pad_prefix = [&](ggml_tensor * x) {
+        if (!replay_skip) {
+            return x;
+        }
+        auto * zeros = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, x->type, x->ne[0], replay_skip), 0.0f);
+        return ggml_concat(ctx0, zeros, x, 1);
+    };
+    int64_t nt = n_tokens;
+
     uint32_t engram_module = 0;
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -525,17 +620,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         if (ubatch.token && hparams.dsv41_engram_layers.test(il)) {
             auto engram_inp =
                 std::make_unique<llm_graph_input_dsv41_engram>(model, inp_attn->mctx->get_raw(), engram_module++);
-            engram_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hash_heads * n_tokens);
+            engram_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hash_heads * nt);
             ggml_set_input(engram_inp->rows);
             ggml_tensor * rows = engram_inp->rows;
             res->add_input(std::move(engram_inp));
 
             ggml_tensor * emb   = ggml_get_rows(ctx0, layer.engram_embd, rows);
-            emb                 = ggml_reshape_2d(ctx0, emb, hash_heads * hparams.dsv41_engram_head_dim, n_tokens);
+            emb                 = ggml_reshape_2d(ctx0, emb, hash_heads * hparams.dsv41_engram_head_dim, nt);
             ggml_tensor * kv    = build_lora_mm(layer.engram_wkv, emb);
-            kv                  = ggml_reshape_3d(ctx0, kv, n_embd, hc + 1, n_tokens);
-            ggml_tensor * key   = ggml_view_3d(ctx0, kv, n_embd, hc, n_tokens, kv->nb[1], kv->nb[2], 0);
-            ggml_tensor * value = ggml_view_2d(ctx0, kv, n_embd, n_tokens, kv->nb[2], kv->nb[1] * hc);
+            kv                  = ggml_reshape_3d(ctx0, kv, n_embd, hc + 1, nt);
+            ggml_tensor * key   = ggml_view_3d(ctx0, kv, n_embd, hc, nt, kv->nb[1], kv->nb[2], 0);
+            ggml_tensor * value = ggml_view_2d(ctx0, kv, n_embd, nt, kv->nb[2], kv->nb[1] * hc);
             key                 = ggml_rms_norm(ctx0, key, norm_rms_eps);
             key                 = ggml_mul(ctx0, key, ggml_cast(ctx0, layer.engram_k, GGML_TYPE_F32));
             ggml_tensor * query = ggml_rms_norm(ctx0, inpL, norm_rms_eps);
@@ -545,13 +640,30 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             ggml_tensor * magnitude = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, score), 1e-6f, INFINITY));
             ggml_tensor * gate      = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, score), magnitude));
             value                   = ggml_cont(ctx0, value);
-            value = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+            value = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, value, n_embd, 1, nt), n_embd, hc, nt, 1);
             inpL  = ggml_add(ctx0, inpL, ggml_mul(ctx0, value, gate));
             cb(inpL, "engram_out", il);
         }
 
+        if (skip && (uint32_t) il == hparams.dsv41_candidate_source_layer) {
+            auto * source = build_norm(build_hc_pre(inpL, pre_mix, il - 1), layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+            build_attention41(model, inp_attn, source, inp_pos, il, true);
+            replay_skip = skip;
+            nt -= skip;
+            LLAMA_LOG_DEBUG("%s: CED encoder tokens = %lld, decoder tokens = %lld\n", __func__, (long long) n_tokens, (long long) nt);
+            inpL = ggml_cont(ctx0, ggml_view_3d(ctx0, inpL, n_embd, hc, nt, inpL->nb[1], inpL->nb[2], skip*inpL->nb[2]));
+            pre_mix = ggml_view_2d(ctx0, pre_mix, hc, nt, pre_mix->nb[1], skip*pre_mix->nb[1]);
+            inp_pos = ggml_view_1d(ctx0, inp_pos, nt, skip*inp_pos->nb[0]);
+            const auto * raw = inp_attn->get_raw();
+            replay_k_idxs = ggml_view_1d(ctx0, raw->get_k_idxs(), nt, skip*raw->get_k_idxs()->nb[0]);
+            replay->mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, raw->get_kq_mask()->ne[0], nt, 1, 1);
+            ggml_set_input(replay->mask);
+            replay_mask = cparams.flash_attn ? ggml_cast(ctx0, replay->mask, GGML_TYPE_F16) : replay->mask;
+            res->n_layer_inp_prefix = skip;
+        }
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc, n_tokens), 1.0f / hc);
+            ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc, nt), 1.0f / hc);
             res->t_layer_inp[il] = build_hc_pre(inpL, weights, il);
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
@@ -594,7 +706,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         pre_mix = ffn_pre;
     }
 
-    ggml_tensor * cur = build_hc_pre(inpL, pre_mix, -1);
+    res->add_input(std::move(replay));
+    ggml_tensor * cur = pad_prefix(build_hc_pre(inpL, pre_mix, -1));
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }

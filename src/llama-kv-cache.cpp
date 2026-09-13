@@ -1748,7 +1748,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, llama_pos min_pos) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1785,6 +1785,21 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    if (min_pos >= 0) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const auto & cells = v_cells.at(seq_to_stream[ubatch->seq_id[i][0]]);
+            for (int64_t k = 0; k < n_kv; ++k) {
+                if (cells.is_empty(k) || cells.pos_get(k) < min_pos) {
+                    if (dst->type == GGML_TYPE_F16) {
+                        ((ggml_fp16_t *) dst->data)[i*n_kv + k] = ggml_fp32_to_fp16(-INFINITY);
+                    } else {
+                        ((float *) dst->data)[i*n_kv + k] = -INFINITY;
+                    }
+                }
+            }
+        }
     }
 
     //const int64_t t_end = ggml_time_us();

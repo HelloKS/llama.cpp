@@ -115,6 +115,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_dsv41_replay_window(uint32_t window);
+    bool layer_inp_is_valid(uint32_t token) const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -303,6 +305,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<bool> embd_layer_inp_valid;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

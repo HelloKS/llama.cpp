@@ -978,6 +978,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
+        if (is_dspark) {
+            const int32_t window = llama_model_n_swa(model_dft);
+            llama_set_dsv41_replay_window(ctx_tgt, window > 0 ? uint32_t(window) : UINT32_MAX);
+        }
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
@@ -1137,7 +1141,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            int32_t first = 0;
+            for (int32_t i = 0; i < n_rows; ++i) {
+                if (!llama_embeddings_layer_inp_is_valid(ctx_tgt, i_batch_beg[seq_id] + i)) {
+                    first = i + 1;
+                }
+            }
+            if (first > 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+            }
+            for (int32_t offset = first; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather target features per extract layer; the fused decode encodes and

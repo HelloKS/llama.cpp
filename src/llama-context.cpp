@@ -236,6 +236,12 @@ llama_context::llama_context(
     cparams.fused_lid = true;
     cparams.auto_flid = false;
 
+    const char * ced = std::getenv("LLAMA_DSV41_CED");
+    if (model.arch == LLM_ARCH_DEEPSEEK41 && (!ced || std::strcmp(ced, "0") != 0)) {
+        cparams.dsv41_replay = hparams.n_swa;
+        LLAMA_LOG_INFO("%s: DeepSeek-V4.1 bounded decoder replay enabled (window = %u)\n", __func__, cparams.dsv41_replay);
+    }
+
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
@@ -1642,6 +1648,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    embd_layer_inp_valid.assign(std::max(0, batch_inp.n_tokens), true);
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2203,6 +2210,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    for (uint32_t i = 0; i < res->n_layer_inp_prefix; ++i) {
+        embd_layer_inp_valid.at(token_offset + i) = false;
+    }
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2218,10 +2228,12 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         const size_t nbytes = ggml_nbytes(t);
         const size_t nfloats = nbytes / sizeof(float);
         GGML_ASSERT(n_tokens > 0);
-        GGML_ASSERT(nfloats % n_tokens == 0);
+        const size_t prefix = res->n_layer_inp_prefix && t->ne[1] == int64_t(n_tokens - res->n_layer_inp_prefix) ? res->n_layer_inp_prefix : 0;
+        const size_t n_rows = n_tokens - prefix;
+        GGML_ASSERT(nfloats % n_rows == 0);
 
-        const size_t row_floats = nfloats / n_tokens;
-        const size_t dst_offset = token_offset * row_floats;
+        const size_t row_floats = nfloats / n_rows;
+        const size_t dst_offset = (token_offset + prefix) * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
@@ -3895,6 +3907,25 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_context::set_dsv41_replay_window(uint32_t window) {
+    if (cparams.dsv41_replay) {
+        cparams.dsv41_replay = std::max(cparams.dsv41_replay, window);
+        cparams.dsv41_replay_features = true;
+    }
+}
+
+bool llama_context::layer_inp_is_valid(uint32_t token) const {
+    return token < embd_layer_inp_valid.size() && embd_layer_inp_valid[token];
+}
+
+void llama_set_dsv41_replay_window(llama_context * ctx, uint32_t window) {
+    ctx->set_dsv41_replay_window(window);
+}
+
+bool llama_embeddings_layer_inp_is_valid(const llama_context * ctx, uint32_t token) {
+    return ctx->layer_inp_is_valid(token);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

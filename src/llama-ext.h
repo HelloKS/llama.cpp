@@ -113,6 +113,10 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+// Extend enabled CED replay to retain the draft model's full attention window.
+LLAMA_API void llama_set_dsv41_replay_window(struct llama_context * ctx, uint32_t window);
+// Skipped CED rows in the layer-input buffers must not be read.
+LLAMA_API bool llama_embeddings_layer_inp_is_valid(const struct llama_context * ctx, uint32_t token);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

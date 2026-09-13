@@ -8000,6 +8000,7 @@ struct test_diag : public test_case {
 
 // GGML_OP_LIGHTNING_INDEXER
 struct test_lightning_indexer : public test_case {
+    const int64_t sparse_k;
     const int64_t hsk; // indexer K head size
     const int64_t nh; // num indexer heads
     const int64_t kv; // kv size
@@ -8010,7 +8011,7 @@ struct test_lightning_indexer : public test_case {
     const ggml_type type_K;
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, type_K, sparse_k);
     }
 
     double max_nmse_err() override {
@@ -8022,8 +8023,8 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16, int64_t sparse_k = 0)
+        : sparse_k(sparse_k), hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -8051,7 +8052,13 @@ struct test_lightning_indexer : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (sparse_k) {
+                    init_tensor_kq_mask_sparse(t, sparse_k);
+                    std::vector<ggml_fp16_t> masked(kv, ggml_fp32_to_fp16(-INFINITY));
+                    ggml_backend_tensor_set(t, masked.data(), 0, masked.size()*sizeof(ggml_fp16_t));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -8856,6 +8863,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_I32}) {
+        for (int r : {24, 511, 513, 12289}) {
+            test_cases.emplace_back(new test_get_rows(type, 256, 1025, r));
+        }
+        test_cases.emplace_back(new test_get_rows(type, 256, 37, 1027, 3, 2, true, true));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -10744,6 +10757,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // lightning_indexer
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_BF16}) {
+        for (int nm : {1, 4}) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 32, 129, 5, 4, nm, type, 3));
+            test_cases.emplace_back(new test_lightning_indexer(128, 64, 129, 5, 4, nm, type, 3));
+        }
+    }
     for (int kv : { 256 }) {
         for (int bs : { 1, 512 }) {
             for (int nh : { 32, 64 }) {

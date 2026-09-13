@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -446,6 +447,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!model) {
         throw std::runtime_error("failed to create llama model");
     }
+    char architecture[32];
+    if (llama_model_meta_val_str(model.get(), "general.architecture", architecture, sizeof(architecture)) > 0 &&
+        std::strcmp(architecture, "deepseek41") == 0) {
+        ctx_params.n_rs_seq = 4;
+    }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
@@ -485,6 +491,46 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static void test_dsv41_replay(llama_model * model, llama_context * ctx) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_set_dsv41_replay_window(ctx, llama_model_n_swa(model));
+    llama_set_embeddings_layer_inp(ctx, 6, true);
+    const auto tokens = get_tokens(96, llama_vocab_n_tokens(llama_model_get_vocab(model)), 17);
+    llama_batch batch = llama_batch_init(96, 0, 1);
+    for (uint32_t i = 0; i < tokens.size(); ++i) {
+        common_batch_add(batch, tokens[i], i, {0}, i + 1 == tokens.size());
+    }
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    GGML_ASSERT(!llama_embeddings_layer_inp_is_valid(ctx, 0));
+    GGML_ASSERT(llama_embeddings_layer_inp_is_valid(ctx, 63));
+    GGML_ASSERT(llama_embeddings_layer_inp_is_valid(ctx, 95));
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        GGML_ASSERT(std::isfinite(llama_get_logits_ith(ctx, -1)[i]));
+    }
+
+    std::vector<uint8_t> state(llama_state_get_size(ctx));
+    GGML_ASSERT(llama_state_get_data(ctx, state.data(), state.size()) == state.size());
+    common_batch_clear(batch);
+    common_batch_add(batch, 5, 96, {0}, true);
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    const float * first = llama_get_logits_ith(ctx, -1);
+    std::vector<float> expected(first, first + n_vocab);
+    GGML_ASSERT(llama_state_set_data(ctx, state.data(), state.size()) == state.size());
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    const float * restored = llama_get_logits_ith(ctx, -1);
+    std::vector<float> actual(restored, restored + n_vocab);
+    fprintf(stderr, "CED state restore NMSE: %.9g\n", nmse(expected, actual));
+    GGML_ASSERT(nmse(expected, actual) < 1e-6);
+    GGML_ASSERT(llama_embeddings_layer_inp_is_valid(ctx, 0));
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx), 0, 96, -1));
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    const float * rewound = llama_get_logits_ith(ctx, -1);
+    GGML_ASSERT(nmse(expected, std::vector<float>(rewound, rewound + n_vocab)) < 1e-6);
+    llama_batch_free(batch);
+    llama_set_embeddings_layer_inp(ctx, 6, false);
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -828,6 +874,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                                 break;
                             }
                         }
+                    }
+                }
+
+                if (arch == LLM_ARCH_DEEPSEEK41 && !skip && model_and_ctx_dev.second) {
+                    const char * ced = std::getenv("LLAMA_DSV41_CED");
+                    if (!ced || std::strcmp(ced, "0") != 0) {
+                        test_dsv41_replay(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get());
                     }
                 }
 
