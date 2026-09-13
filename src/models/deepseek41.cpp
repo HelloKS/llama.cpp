@@ -563,7 +563,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         ggml_tensor * attn_comb = nullptr;
         build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &attn_post, &attn_comb, il,
                      &attn_pre);
-        ggml_tensor * cur = build_hc_pre(inpL, pre_mix, il);
+        const int pre_mix_il = il > 0 ? il - 1 : il;
+        ggml_tensor * cur = build_hc_pre(inpL, pre_mix, pre_mix_il);
         cur               = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cur               = build_attention41(model, inp_attn, cur, inp_pos, il);
         inpL              = build_hc_post(cur, residual, attn_post, attn_comb, il);
