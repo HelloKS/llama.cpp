@@ -80,6 +80,9 @@ struct llama_memory_i {
 
     using layer_share_cb = std::function<int32_t(int32_t il)>;
 
+    // this callback is used to select the device-owning layer for memory allocated on behalf of layer il
+    using layer_placement_cb = std::function<int32_t(int32_t il)>;
+
     virtual ~llama_memory_i() = default;
 
     // split the input batch into a set of ubatches and verify that they can fit into the cache

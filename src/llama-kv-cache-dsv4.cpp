@@ -1299,6 +1299,22 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         return !is_v41 && filter_csa(il);
     };
 
+    // Place shared compressed caches near the center of their consumer range.
+    const layer_placement_cb placement_comp = [&](int32_t il) {
+        if (!is_v41) {
+            return il;
+        }
+
+        const uint32_t ratio = model.hparams.dsv4_compress_ratios[il];
+        int32_t il_end = il + 1;
+        while (il_end < (int32_t) model.hparams.n_layer() &&
+                model.hparams.dsv4_compress_ratios[il_end] == ratio &&
+                !model.hparams.dsv41_kv_sources.test(il_end)) {
+            ++il_end;
+        }
+        return il + (il_end - il - 1) / 2;
+    };
+
     const bool unified_compressed = false;
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
@@ -1307,7 +1323,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, csa_ratio), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, "", placement_comp);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, hca_ratio));
@@ -1315,7 +1331,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, hca_ratio), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, "", placement_comp);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, lid_ratio));
@@ -1323,7 +1339,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, lid_ratio), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_lid, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_lid, nullptr, nullptr, "", placement_comp);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
