@@ -1360,6 +1360,34 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::set_prepare_callback(ggml_backend_sched_t sched) {
+    const bool deferred = std::any_of(inputs.begin(), inputs.end(), [](const auto & input) {
+        return input->get_prepare_node() != nullptr;
+    });
+    if (!deferred) {
+        ggml_backend_sched_set_prepare_callback(sched, nullptr, nullptr);
+        return;
+    }
+    ggml_backend_sched_set_prepare_callback(sched, [](ggml_tensor * node, bool ask, void * user_data) {
+        auto * res = static_cast<llm_graph_result *>(user_data);
+        for (auto & input : res->inputs) {
+            if (input->get_prepare_node() != node) {
+                continue;
+            }
+            if (!ask) {
+                try {
+                    input->prepare();
+                } catch (const std::exception & err) {
+                    LLAMA_LOG_ERROR("%s: input preparation failed: %s\n", __func__, err.what());
+                    return false;
+                }
+            }
+            return true;
+        }
+        return !ask;
+    }, this);
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);

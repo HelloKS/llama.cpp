@@ -8,9 +8,15 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -21,6 +27,63 @@
 #include <unistd.h>
 #endif
 
+class llama_lazy_reader_pool {
+public:
+    explicit llama_lazy_reader_pool(int n_threads) {
+        try {
+            for (int i = 0; i < n_threads; ++i) {
+                workers.emplace_back([this] {
+                    for (;;) {
+                        std::function<void()> task;
+                        {
+                            std::unique_lock<std::mutex> lock(mutex);
+                            ready.wait(lock, [this] { return stopping || !tasks.empty(); });
+                            if (tasks.empty()) {
+                                return;
+                            }
+                            task = std::move(tasks.back());
+                            tasks.pop_back();
+                        }
+                        task();
+                    }
+                });
+            }
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+
+    ~llama_lazy_reader_pool() { stop(); }
+
+    void submit(std::vector<std::function<void()>> batch) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(tasks.empty());
+            tasks = std::move(batch);
+        }
+        ready.notify_all();
+    }
+
+private:
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        ready.notify_all();
+        for (auto & worker : workers) {
+            worker.join();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::vector<std::thread> workers;
+    std::vector<std::function<void()>> tasks;
+    bool stopping = false;
+};
+
 struct llama_lazy_reader {
 #ifdef _WIN32
     // pread()/open() are unavailable on Windows; --lazy-mode on-direct falls
@@ -28,6 +91,9 @@ struct llama_lazy_reader {
     const int64_t head_dim = 0;
 
     void gather(const int32_t *, int64_t, float *) const {
+        GGML_ABORT("lazy direct reads are not supported on this platform");
+    }
+    std::shared_future<void> gather_async(const int32_t *, int64_t, float *) const {
         GGML_ABORT("lazy direct reads are not supported on this platform");
     }
 #else
@@ -43,6 +109,7 @@ struct llama_lazy_reader {
     llama_lazy_reader & operator=(const llama_lazy_reader &) = delete;
 
     ~llama_lazy_reader() {
+        pool.reset();
         if (fd >= 0) {
             ::close(fd);
         }
@@ -60,6 +127,15 @@ struct llama_lazy_reader {
     // dst[slot * head_dim, ...) = to_float(table[rows[slot]])
     // thread-safe; never lets an exception escape a worker thread
     void gather(const int32_t * rows, int64_t n, float * dst) const {
+        gather_async(rows, n, dst).get();
+    }
+
+    // One batch per reader bounds queued work. The caller keeps dst alive until completion.
+    std::shared_future<void> gather_async(const int32_t * rows, int64_t n, float * dst) const {
+        std::unique_lock<std::mutex> lock(submit_mutex);
+        if (pending.valid()) {
+            pending.wait();
+        }
         std::vector<std::pair<int32_t, int32_t>> pairs; // (row, dst slot)
         pairs.reserve(n);
         for (int64_t i = 0; i < n; ++i) {
@@ -69,48 +145,56 @@ struct llama_lazy_reader {
 
         std::sort(pairs.begin(), pairs.end()); // equal rows adjacent, file order
 
-        // small gathers are not worth a thread per row
         const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, n / 32));
+        if (n_workers == 1) {
+            run_range(pairs, 0, n, dst);
+            std::promise<void> done;
+            done.set_value();
+            return done.get_future().share();
+        }
 
-        // worker w reads rows pairs[n*w/n_workers, n*(w+1)/n_workers)
-        auto run_chunk = [&](int w, std::exception_ptr & err) {
-            try {
-                run_range(pairs, n * w / n_workers, n * (w + 1) / n_workers, dst);
-            } catch (...) {
-                err = std::current_exception();
-            }
+        struct request {
+            std::vector<std::pair<int32_t, int32_t>> pairs;
+            std::vector<std::exception_ptr> errors;
+            std::atomic<int> remaining;
+            std::promise<void> done;
+            explicit request(int count) : errors(count), remaining(count) {}
         };
-
-        // an exception leaving a joinable std::thread, or destroying one,
-        // terminates the process; keep worker creation failure-safe
-        std::vector<std::exception_ptr> errs(n_workers);
-        std::vector<std::thread> workers;
-        try {
-            for (int w = 1; w < n_workers; ++w) {
-                workers.emplace_back([&run_chunk, &errs, w]() {
-                    run_chunk(w, errs[w]);
-                });
-            }
-        } catch (...) {
-            for (auto & t : workers) {
-                t.join();
-            }
-            throw;
+        auto work = std::make_shared<request>(n_workers);
+        work->pairs = std::move(pairs);
+        std::vector<std::function<void()>> tasks;
+        tasks.reserve(n_workers);
+        for (int w = 0; w < n_workers; ++w) {
+            tasks.emplace_back([this, work, n, n_workers, w, dst] {
+                try {
+                    run_range(work->pairs, n * w / n_workers, n * (w + 1) / n_workers, dst);
+                } catch (...) {
+                    work->errors[w] = std::current_exception();
+                }
+                if (work->remaining.fetch_sub(1) == 1) {
+                    for (const auto & error : work->errors) {
+                        if (error) {
+                            work->done.set_exception(error);
+                            return;
+                        }
+                    }
+                    work->done.set_value();
+                }
+            });
         }
-
-        run_chunk(0, errs[0]); // this thread takes the first chunk
-        for (auto & t : workers) {
-            t.join();
+        if (!pool) {
+            pool = std::make_unique<llama_lazy_reader_pool>(n_threads);
         }
-
-        for (const auto & err : errs) {
-            if (err) {
-                std::rethrow_exception(err);
-            }
-        }
+        pending = work->done.get_future().share();
+        pool->submit(std::move(tasks));
+        return pending;
     }
 
 private:
+    mutable std::mutex submit_mutex;
+    mutable std::unique_ptr<llama_lazy_reader_pool> pool;
+    mutable std::shared_future<void> pending;
+
     void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
                    int64_t begin, int64_t end, float * dst) const {
         std::vector<uint8_t> bounce(row_size);

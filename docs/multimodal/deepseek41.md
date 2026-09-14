@@ -73,6 +73,8 @@ Startup must report `direct reads enabled for blk.N.engram_embd.weight` for each
 
 Despite its name, `on-direct` does not use `O_DIRECT` or bypass the OS page cache. It avoids mapped-page faults in the graph by reading the requested rows explicitly. Each Engram input also keeps an F32 host staging buffer of `n_tokens * hash_heads * head_dim * sizeof(float)` bytes; it does not cache the full table. Measure cold and warm real-text requests with DSpark enabled to check both throughput and memory headroom.
 
+For prefill microbatches of at least 32 tokens, direct Engram reads start during input preparation and finish before each table's first consumer. Earlier layers can execute while reusable reader workers gather the rows. This is enabled by default, including with RPC tensor splitting, and reuses the existing F32 staging buffers. Set `LLAMA_DSV41_ENGRAM_ASYNC=0` on `llama-server` to use synchronous gathering for comparison. Small decode batches and unsupported graph paths keep synchronous gathering. No batch or context increase is required.
+
 ### Tensor splitting over two RPC workers
 
 This fork includes [PR #26610](https://github.com/ggml-org/llama.cpp/pull/26610). Its pairwise reduction requires exactly two RPC devices on separate endpoints. Run an RPC worker on each Spark, including the Spark that runs `llama-server`, and select only the two RPC devices for the target model. A local CUDA device plus one RPC device uses the generic reduction path.

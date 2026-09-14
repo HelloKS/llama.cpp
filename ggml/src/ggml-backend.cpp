@@ -779,6 +779,7 @@ struct ggml_backend_sched_split {
     struct ggml_tensor ** inputs;
     int n_inputs;
     int inputs_capacity;
+    struct ggml_tensor * prepare_node;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -825,6 +826,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    ggml_backend_sched_prepare_callback callback_prepare;
+    void * callback_prepare_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1309,6 +1312,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->prepare_node = nullptr;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1322,7 +1326,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
-            bool need_new_split = false;
+            const bool prepare = sched->callback_prepare && sched->callback_prepare(node, true, sched->callback_prepare_user_data);
+            bool need_new_split = prepare && i > split->i_start;
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1358,7 +1363,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->prepare_node = nullptr;
                 cur_backend_id = node_backend_id;
+            }
+
+            if (prepare) {
+                split->prepare_node = node;
             }
 
             // find inputs that are not on the same backend
@@ -1654,6 +1664,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (split->prepare_node && sched->callback_prepare &&
+            !sched->callback_prepare(split->prepare_node, false, sched->callback_prepare_user_data)) {
+            ggml_backend_sched_synchronize(sched);
+            return GGML_STATUS_FAILED;
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2039,6 +2055,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_prepare_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_prepare = callback;
+    sched->callback_prepare_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

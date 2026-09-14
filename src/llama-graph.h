@@ -109,6 +109,9 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    virtual ggml_tensor * get_prepare_node() const { return nullptr; }
+    virtual void prepare() {}
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -809,6 +812,7 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    bool async_inputs = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -872,6 +876,7 @@ struct llm_graph_params {
         }
 
         return
+            async_inputs                   == other.async_inputs                   &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
@@ -913,6 +918,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    void set_prepare_callback(ggml_backend_sched_t sched);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

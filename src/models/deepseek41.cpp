@@ -254,7 +254,16 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
         module(module),
         reader(reader) {}
 
+    ~llm_graph_input_dsv41_engram() override {
+        if (pending.valid()) {
+            pending.wait();
+        }
+    }
+
     void set_input(const llama_ubatch * ubatch) override {
+        if (pending.valid()) {
+            pending.wait();
+        }
         const auto &             hp              = model.hparams;
         const int64_t            n_tokens        = ubatch->n_tokens;
         const int64_t            ngram           = hp.dsv41_engram_max_ngram_size;
@@ -293,11 +302,23 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
 
         if (reader) {
             staging.resize(idx.size() * reader->head_dim);
-            reader->gather(idx.data(), idx.size(), staging.data());
-            ggml_backend_tensor_set(data, staging.data(), 0, staging.size() * sizeof(float));
+            if (consumer) {
+                pending = reader->gather_async(idx.data(), idx.size(), staging.data());
+            } else {
+                reader->gather(idx.data(), idx.size(), staging.data());
+                ggml_backend_tensor_set(data, staging.data(), 0, staging.size() * sizeof(float));
+            }
         } else {
             ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * sizeof(int32_t));
         }
+    }
+
+    ggml_tensor * get_prepare_node() const override { return consumer; }
+
+    void prepare() override {
+        GGML_ASSERT(pending.valid());
+        pending.get();
+        ggml_backend_tensor_set(data, staging.data(), 0, staging.size() * sizeof(float));
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -309,11 +330,13 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
 
     ggml_tensor *                  rows = nullptr;
     ggml_tensor *                  data = nullptr;
+    ggml_tensor *                  consumer = nullptr;
     const llama_model_deepseek41 & model;
     const llama_kv_cache_dsv4_raw_context * mctx;
     const uint32_t                 module;
     const llama_lazy_reader *      reader;
     std::vector<float>             staging;
+    std::shared_future<void>        pending;
 };
 
 static uint32_t dsv41_replay_skip(const llm_graph_params & params) {
@@ -644,10 +667,16 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 ggml_set_input(engram_inp->rows);
                 emb = ggml_get_rows(ctx0, layer.engram_embd, engram_inp->rows);
             }
-            res->add_input(std::move(engram_inp));
-
             emb                 = ggml_reshape_2d(ctx0, emb, hash_heads * hparams.dsv41_engram_head_dim, nt);
             ggml_tensor * kv    = build_lora_mm(layer.engram_wkv, emb);
+            const char * async_env = std::getenv("LLAMA_DSV41_ENGRAM_ASYNC");
+            if (params.async_inputs && nt >= 32 && engram_inp->reader && (!async_env || std::atoi(async_env) != 0) &&
+                kv->op == GGML_OP_MUL_MAT && kv->src[1] == emb) {
+                // Submit preceding layers before waiting for this table's rows.
+                ggml_build_forward_expand(gf, inpL);
+                engram_inp->consumer = kv;
+            }
+            res->add_input(std::move(engram_inp));
             kv                  = ggml_reshape_3d(ctx0, kv, n_embd, hc + 1, nt);
             ggml_tensor * key   = ggml_view_3d(ctx0, kv, n_embd, hc, nt, kv->nb[1], kv->nb[2], 0);
             ggml_tensor * value = ggml_view_2d(ctx0, kv, n_embd, nt, kv->nb[2], kv->nb[1] * hc);
