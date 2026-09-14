@@ -209,6 +209,18 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Optional NCCL interface for one device per process. Bootstrap data is opaque to RPC.
+    struct ggml_backend_nccl_interface {
+        uint32_t version;
+        size_t id_size;
+        int library_version;
+        bool (*get_id)(void * id);
+        void * (*init_rank)(ggml_backend_t backend, const void * id, size_t id_size, int rank, int world, bool fp32);
+        bool (*reduce)(void * comm_ctx, struct ggml_tensor * tensor);
+        void (*free)(void * comm_ctx, bool abort);
+    };
+    typedef const struct ggml_backend_nccl_interface * (*ggml_backend_get_nccl_interface_t)(void);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

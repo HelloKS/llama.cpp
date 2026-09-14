@@ -79,7 +79,7 @@ For prefill microbatches of at least 32 tokens, direct Engram reads start during
 
 This fork includes [PR #26610](https://github.com/ggml-org/llama.cpp/pull/26610). Its pairwise reduction requires exactly two RPC devices on separate endpoints. Run an RPC worker on each Spark, including the Spark that runs `llama-server`, and select only the two RPC devices for the target model. A local CUDA device plus one RPC device uses the generic reduction path.
 
-Build the client and both workers from the same source with `GGML_RPC=ON`; this change uses RPC protocol 7. Start each worker with `ggml-rpc-server --host 0.0.0.0 --port 50052`. Use the two mutually reachable RDMA addresses in the client's `--rpc` list, including the local worker's RDMA address rather than a loopback address. Rank 1 connects to rank 0 on the first endpoint's RPC port plus 1000, or port 51052 with this example. An unreachable peer can stall communicator initialization.
+Build the client and both workers from the same source with `GGML_RPC=ON`; this change uses RPC protocol 8. Start each worker with `ggml-rpc-server --host 0.0.0.0 --port 50052`. Use the two mutually reachable RDMA addresses in the client's `--rpc` list, including the local worker's RDMA address rather than a loopback address. Rank 1 connects to rank 0 on the first endpoint's RPC port plus 1000, or port 51052 with this example. An unreachable peer can stall communicator initialization.
 
 Replace the target server's split and device options with the following, substituting the addresses and device names reported by `--list-devices`:
 
@@ -90,6 +90,25 @@ Replace the target server's split and device options with the following, substit
 Keep context and batch sizes unchanged for the comparison. CED and `--lazy-mode on-direct` can stay enabled. Check for `pairwise communicator initialized` and RDMA negotiation on the worker-to-worker connection. `GGML_RPC_NO_COMM=1` disables the custom reduction for a separate fallback comparison.
 
 Large F32 partials are sent as BF16 and restored before addition; this introduces rounding relative to F32 reductions. The implementation still uses host staging and synchronization, not NCCL or GPU-direct transfers. Test target-only output first, then DSpark, including retained features, cache reuse, and memory headroom. Local TCP checks do not establish GB10/RDMA performance or full DSpark compatibility.
+
+### NCCL between RPC workers
+
+The default remains the pairwise RPC exchange. To select NCCL for large reductions, start `llama-server` with `GGML_RPC_ALLREDUCE=nccl-exchange` in its environment. This selector belongs on the client; it negotiates the route with both workers. Both workers must use the same NCCL runtime version, at least 2.18, and be built with `GGML_CUDA=ON`, `GGML_CUDA_NCCL=ON`, and `GGML_RPC=ON`. Keep RDMA enabled. Rebuild and restart the client and both workers because protocol 8 is incompatible with protocol 7.
+
+Supported modes:
+
+- `pairwise` (default): existing direct worker-to-worker transport.
+- `nccl-exchange`: grouped NCCL send/receive for F32 reductions with at least 32,768 elements, preserving the existing BF16 wire conversion and local F32 addition.
+- `nccl-f32`: native F32 NCCL all-reduce for the same large reductions. This changes wire traffic and numerical behavior relative to the BF16 exchange.
+- `auto`: try `nccl-exchange`, then use pairwise only after coordinated initialization cleanup if NCCL is unavailable. Forced NCCL modes fail instead of silently falling back.
+
+All modes retain the current pairwise route for smaller reductions. `GGML_RPC_NO_COMM` continues to disable the custom communicator. Keep DSpark, Engram overlap, tile selection, batch, and context settings fixed when comparing PP and TG. The exchange mode aims to preserve the current per-rank result, which can differ between ranks because only the received partial is rounded to BF16. It does not introduce BF16 rounding of the local partial or the final sum.
+
+Startup reports the selected NCCL mode and library version. Set `NCCL_DEBUG=INFO` and `NCCL_DEBUG_SUBSYS=INIT,NET` on both workers to verify that NCCL selects the ConnectX-7 RDMA path. Existing RPC RDMA negotiation alone does not prove the NCCL transport selection. Spark does not support conventional GPUDirect RDMA to CUDA allocations; use NCCL's supported network staging path rather than forcing GPUDirect settings.
+
+Communication uses the worker's CUDA compute stream and reusable scratch buffers. A progress watchdog terminates the worker on an asynchronous failure or 60 seconds without completion progress. Restart both workers and the client after such a failure; the implementation does not replay an in-flight reduction through a fallback. The timeout also applies to NCCL initialization, but does not change the existing pairwise socket bootstrap timeout behavior.
+
+For a direct numerical check after rebuilding, run `GGML_RPC_ALLREDUCE=nccl-exchange build/bin/test-rpc-multi-server SPARK_A_RDMA_IP:50052 SPARK_B_RDMA_IP:50052` against idle workers, then repeat with `nccl-f32`. This checks fractional inputs, both sides of the reduction threshold, graph reuse, and deferred input copies. Do not run this test concurrently with the model server. CPU/Metal builds and local CPU RPC tests do not validate CUDA/NCCL execution or prove a PP gain on GB10.
 
 ### Experimental SM12x Q2_K MoE tile selection
 

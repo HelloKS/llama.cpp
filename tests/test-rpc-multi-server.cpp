@@ -5,6 +5,9 @@
 #include "ggml.h"
 
 #include <vector>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
 
 static void test_deferred_inputs(ggml_backend_t backend_a, ggml_backend_t backend_b, bool parallel) {
     auto cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -96,7 +99,9 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
     void * comm = comm_init(backends, 2);
     GGML_ASSERT(comm);
 
-    for (int64_t n : {16, 65536}) {
+    const char * mode = std::getenv("GGML_RPC_ALLREDUCE");
+    const bool fp32 = mode && std::strcmp(mode, "nccl-f32") == 0;
+    for (int64_t n : {16, 32767, 32768, 65536}) {
         ggml_context * contexts[2];
         ggml_backend_buffer_t buffers[2];
         ggml_tensor * inputs[2];
@@ -120,7 +125,7 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
         for (int iteration = 0; iteration < 3; ++iteration) {
             for (int rank = 0; rank < 2; ++rank) {
                 for (int64_t i = 0; i < n; ++i) {
-                    values[rank][i] = i % 8 + iteration + rank;
+                    values[rank][i] = i % 8 + iteration + rank + 0.003f*(i % 7);
                 }
                 ggml_backend_tensor_set_async(backends[rank], inputs[rank], values[rank].data(), 0, n*sizeof(float));
                 GGML_ASSERT(ggml_backend_graph_compute_async(backends[rank], graphs[rank]) == GGML_STATUS_SUCCESS);
@@ -130,7 +135,12 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
                 ggml_backend_tensor_get_async(backends[rank], outputs[rank], result.data(), 0, n*sizeof(float));
                 ggml_backend_synchronize(backends[rank]);
                 for (int64_t i = 0; i < n; ++i) {
-                    GGML_ASSERT(result[i] == 5.0f*(i % 8 + iteration) + 3.0f);
+                    const float local = values[rank][i] * (rank + 2.0f);
+                    float peer = values[1 - rank][i] * (3.0f - rank);
+                    if (n >= 32768 && !fp32) {
+                        peer = ggml_bf16_to_fp32(ggml_fp32_to_bf16(peer));
+                    }
+                    GGML_ASSERT(std::fabs(result[i] - (local + peer)) < 1e-5f);
                 }
             }
         }

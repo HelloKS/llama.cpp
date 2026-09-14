@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-cpp.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -75,6 +76,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -89,6 +91,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -1068,6 +1071,210 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     }
 
     return true;
+}
+#endif // GGML_USE_NCCL
+
+#if defined(GGML_USE_NCCL) && NCCL_VERSION_CODE >= 21800
+static constexpr auto nccl_rank_timeout = std::chrono::seconds(60);
+
+static bool ggml_cuda_nccl_wait(ncclResult_t result, ncclComm_t comm) {
+    const auto deadline = std::chrono::steady_clock::now() + nccl_rank_timeout;
+    while (result == ncclInProgress && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const ncclResult_t status = ncclCommGetAsyncError(comm, &result);
+        if (status != ncclSuccess) {
+            result = status;
+        }
+    }
+    if (result != ncclSuccess) {
+        GGML_LOG_ERROR("NCCL rank operation failed: %s\n", ncclGetErrorString(result));
+        return false;
+    }
+    return true;
+}
+
+struct ggml_cuda_nccl_rank {
+    ggml_backend_t backend = nullptr;
+    ncclComm_t comm = nullptr;
+    int rank = 0;
+    bool fp32 = false;
+    ggml_backend_buffer_ptr scratch;
+    size_t scratch_size = 0;
+    std::array<cudaEvent_t, 64> events = {};
+    std::atomic<uint64_t> posted{0}, completed{0};
+    std::atomic<bool> stopping{false};
+    std::mutex nccl_mutex;
+    std::thread watchdog;
+
+    void watch() {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        auto progress = std::chrono::steady_clock::now();
+        while (!stopping.load()) {
+            const uint64_t done = completed.load();
+            if (done < posted.load()) {
+                std::unique_lock<std::mutex> lock(nccl_mutex, std::try_to_lock);
+                ncclResult_t error = ncclSuccess;
+                const ncclResult_t status = lock.owns_lock() ? ncclCommGetAsyncError(comm, &error) : ncclSuccess;
+                const cudaError_t event_status = cudaEventQuery(events[done % events.size()]);
+                if (status != ncclSuccess || (error != ncclSuccess && error != ncclInProgress) ||
+                    (event_status != cudaSuccess && event_status != cudaErrorNotReady) ||
+                    std::chrono::steady_clock::now() - progress > nccl_rank_timeout) {
+                    if (lock.owns_lock()) {
+                        ncclCommAbort(comm);
+                    }
+                    GGML_ABORT("NCCL rank %d failed or made no progress for 60 seconds; restart both RPC workers", rank);
+                }
+                if (event_status == cudaSuccess) {
+                    completed.store(done + 1);
+                    progress = std::chrono::steady_clock::now();
+                    continue;
+                }
+            } else {
+                progress = std::chrono::steady_clock::now();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+};
+
+static bool ggml_cuda_nccl_get_id(void * id) {
+    return ncclGetUniqueId(static_cast<ncclUniqueId *>(id)) == ncclSuccess;
+}
+
+static void ggml_cuda_nccl_free_rank(void * opaque, bool abort) {
+    std::unique_ptr<ggml_cuda_nccl_rank> state(static_cast<ggml_cuda_nccl_rank *>(opaque));
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(state->backend->context);
+    ggml_cuda_set_device(cuda_ctx->device);
+    if (!abort) {
+        // The watchdog remains active while outstanding device work drains.
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
+    state->stopping.store(true);
+    if (state->watchdog.joinable()) {
+        state->watchdog.join();
+    }
+    if (abort || !ggml_cuda_nccl_wait(ncclCommFinalize(state->comm), state->comm)) {
+        ncclCommAbort(state->comm);
+    } else {
+        NCCL_CHECK(ncclCommDestroy(state->comm));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    for (cudaEvent_t event : state->events) {
+        if (event) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
+    }
+}
+
+static void * ggml_cuda_nccl_init_rank(ggml_backend_t backend, const void * id, size_t id_size, int rank, int world, bool fp32) {
+    if (!ggml_backend_is_cuda(backend) || id_size != sizeof(ncclUniqueId) || world != 2 || rank < 0 || rank >= world ||
+        ggml_cuda_info().device_count != ggml_cuda_info().physical_device_count) {
+        return nullptr;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(cuda_ctx->device);
+    auto state = std::make_unique<ggml_cuda_nccl_rank>();
+    state->backend = backend;
+    state->rank = rank;
+    state->fp32 = fp32;
+    ncclUniqueId unique_id;
+    memcpy(&unique_id, id, sizeof(unique_id));
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    config.blocking = 0;
+    const ncclResult_t initialized = ncclCommInitRankConfig(&state->comm, world, unique_id, rank, &config);
+    if (!ggml_cuda_nccl_wait(initialized, state->comm)) {
+        if (state->comm) {
+            ncclCommAbort(state->comm);
+        }
+        return nullptr;
+    }
+    for (auto & event : state->events) {
+        if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+            ggml_cuda_nccl_free_rank(state.release(), true);
+            return nullptr;
+        }
+    }
+    try {
+        state->watchdog = std::thread([ptr = state.get()] { ptr->watch(); });
+    } catch (const std::exception & err) {
+        GGML_LOG_ERROR("NCCL watchdog creation failed: %s\n", err.what());
+        ggml_cuda_nccl_free_rank(state.release(), true);
+        return nullptr;
+    }
+    return state.release();
+}
+
+static bool ggml_cuda_nccl_reduce_rank(void * opaque, ggml_tensor * tensor) {
+    auto * state = static_cast<ggml_cuda_nccl_rank *>(opaque);
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(state->backend->context);
+    if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) || !(tensor->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return false;
+    }
+    const int64_t ne = ggml_nelements(tensor);
+    if (ne == 0) {
+        return true;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
+    cudaStream_t stream = cuda_ctx->stream();
+    const uint64_t ticket = state->posted.load();
+    while (ticket - state->completed.load() >= state->events.size()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (state->fp32) {
+        std::lock_guard<std::mutex> lock(state->nccl_mutex);
+        if (!ggml_cuda_nccl_wait(ncclAllReduce(tensor->data, tensor->data, ne, ncclFloat, ncclSum, state->comm, stream), state->comm)) {
+            return false;
+        }
+    } else {
+        const size_t need = size_t(ne) * 2 * sizeof(float);
+        if (state->scratch_size < need) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            state->scratch.reset();
+            state->scratch.reset(ggml_backend_alloc_buffer(state->backend, need));
+            if (!state->scratch) {
+                return false;
+            }
+            state->scratch_size = need;
+        }
+        auto * send = static_cast<nv_bfloat16 *>(ggml_backend_buffer_get_base(state->scratch.get()));
+        auto * recv = send + ne;
+        auto * peer = reinterpret_cast<float *>(recv + ne);
+        ggml_get_to_bf16_cuda(GGML_TYPE_F32)(tensor->data, send, ne, stream);
+        {
+            std::lock_guard<std::mutex> lock(state->nccl_mutex);
+            NCCL_CHECK(ncclGroupStart());
+            const ncclResult_t sent = ncclSend(send, ne, ncclBfloat16, 1 - state->rank, state->comm, stream);
+            const ncclResult_t received = ncclRecv(recv, ne, ncclBfloat16, 1 - state->rank, state->comm, stream);
+            const ncclResult_t grouped = ncclGroupEnd();
+            if (sent != ncclSuccess || received != ncclSuccess || !ggml_cuda_nccl_wait(grouped, state->comm)) {
+                return false;
+            }
+        }
+        ggml_get_to_fp32_cuda(GGML_TYPE_BF16)(recv, peer, ne, stream);
+        ggml_tensor peer_tensor = *tensor;
+        peer_tensor.data = peer;
+        peer_tensor.buffer = state->scratch.get();
+        ggml_tensor sum = *tensor;
+        sum.src[0] = tensor;
+        sum.src[1] = &peer_tensor;
+        ggml_cuda_op_add(*cuda_ctx, &sum);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(state->events[ticket % state->events.size()], stream));
+    state->posted.store(ticket + 1);
+    return true;
+}
+
+static const ggml_backend_nccl_interface * ggml_backend_cuda_get_nccl_interface() {
+    static const ggml_backend_nccl_interface iface = [] {
+        int version = 0;
+        ncclGetVersion(&version);
+        return ggml_backend_nccl_interface{1, sizeof(ncclUniqueId), version, ggml_cuda_nccl_get_id,
+            ggml_cuda_nccl_init_rank, ggml_cuda_nccl_reduce_rank, ggml_cuda_nccl_free_rank};
+    }();
+    return iface.library_version >= 21800 ? &iface : nullptr;
 }
 #endif // GGML_USE_NCCL
 
@@ -5669,6 +5876,11 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if defined(GGML_USE_NCCL) && NCCL_VERSION_CODE >= 21800
+    if (strcmp(name, "ggml_backend_get_nccl_interface") == 0) {
+        return (void *) ggml_backend_cuda_get_nccl_interface;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
