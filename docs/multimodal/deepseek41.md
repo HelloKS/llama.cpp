@@ -73,6 +73,22 @@ Startup must report `direct reads enabled for blk.N.engram_embd.weight` for each
 
 Despite its name, `on-direct` does not use `O_DIRECT` or bypass the OS page cache. It avoids mapped-page faults in the graph by reading the requested rows explicitly. Each Engram input also keeps an F32 host staging buffer of `n_tokens * hash_heads * head_dim * sizeof(float)` bytes; it does not cache the full table. Measure cold and warm real-text requests with DSpark enabled to check both throughput and memory headroom.
 
+### Tensor splitting over two RPC workers
+
+This fork includes [PR #26610](https://github.com/ggml-org/llama.cpp/pull/26610). Its pairwise reduction requires exactly two RPC devices on separate endpoints. Run an RPC worker on each Spark, including the Spark that runs `llama-server`, and select only the two RPC devices for the target model. A local CUDA device plus one RPC device uses the generic reduction path.
+
+Build the client and both workers from the same source with `GGML_RPC=ON`; this change uses RPC protocol 7. Start each worker with `ggml-rpc-server --host 0.0.0.0 --port 50052`. Use the two mutually reachable RDMA addresses in the client's `--rpc` list, including the local worker's RDMA address rather than a loopback address. Rank 1 connects to rank 0 on the first endpoint's RPC port plus 1000, or port 51052 with this example. An unreachable peer can stall communicator initialization.
+
+Replace the target server's split and device options with the following, substituting the addresses and device names reported by `--list-devices`:
+
+```sh
+--rpc SPARK_A_RDMA_IP:50052,SPARK_B_RDMA_IP:50052 --device RPC0,RPC1 -sm tensor -ts 1,1 -fa on
+```
+
+Keep context and batch sizes unchanged for the comparison. CED and `--lazy-mode on-direct` can stay enabled. Check for `pairwise communicator initialized` and RDMA negotiation on the worker-to-worker connection. `GGML_RPC_NO_COMM=1` disables the custom reduction for a separate fallback comparison.
+
+Large F32 partials are sent as BF16 and restored before addition; this introduces rounding relative to F32 reductions. The implementation still uses host staging and synchronization, not NCCL or GPU-direct transfers. Test target-only output first, then DSpark, including retained features, cache reuse, and memory headroom. Local TCP checks do not establish GB10/RDMA performance or full DSpark compatibility.
+
 ## Investigating slow prompt processing
 
 Throughput alone does not distinguish GPU kernels, CPU work, page faults, or RPC waits. The CPU compute-buffer size also does not show how much time runs on the CPU. Collect the following with no other inference requests running.
