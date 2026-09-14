@@ -93,14 +93,14 @@ Large F32 partials are sent as BF16 and restored before addition; this introduce
 
 ### NCCL between RPC workers
 
-The default remains the pairwise RPC exchange. To select NCCL for large reductions, start `llama-server` with `GGML_RPC_ALLREDUCE=nccl-exchange` in its environment. This selector belongs on the client; it negotiates the route with both workers. Both workers must use the same NCCL runtime version, at least 2.18, and be built with `GGML_CUDA=ON`, `GGML_CUDA_NCCL=ON`, and `GGML_RPC=ON`. Keep RDMA enabled. Rebuild and restart the client and both workers because protocol 8 is incompatible with protocol 7.
+The default automatically selects NCCL for large reductions when both workers support it, with pairwise RPC exchange as the initialization fallback. No environment variable is needed to enable this. To override the selection, set `GGML_RPC_ALLREDUCE` on the `llama-server` client; it negotiates the route with both workers. Both workers must use the same NCCL runtime version, at least 2.18, and be built with `GGML_CUDA=ON`, `GGML_CUDA_NCCL=ON`, and `GGML_RPC=ON`. Keep RDMA enabled. Rebuild and restart the client and both workers because protocol 8 is incompatible with protocol 7.
 
 Supported modes:
 
-- `pairwise` (default): existing direct worker-to-worker transport.
+- `pairwise`: existing direct worker-to-worker transport; disables NCCL selection.
 - `nccl-exchange`: grouped NCCL send/receive for F32 reductions with at least 32,768 elements, preserving the existing BF16 wire conversion and local F32 addition.
 - `nccl-f32`: native F32 NCCL all-reduce for the same large reductions. This changes wire traffic and numerical behavior relative to the BF16 exchange.
-- `auto`: try `nccl-exchange`, then use pairwise only after coordinated initialization cleanup if NCCL is unavailable. Forced NCCL modes fail instead of silently falling back.
+- `auto` (default): try `nccl-exchange`, then use pairwise only after coordinated initialization cleanup if NCCL is unavailable. Forced NCCL modes fail instead of silently falling back.
 
 All modes retain the current pairwise route for smaller reductions. `GGML_RPC_NO_COMM` continues to disable the custom communicator. Keep DSpark, Engram overlap, tile selection, batch, and context settings fixed when comparing PP and TG. The exchange mode aims to preserve the current per-rank result, which can differ between ranks because only the received partial is rounded to BF16. It does not introduce BF16 rounding of the local partial or the final sum.
 
@@ -112,9 +112,9 @@ For a direct numerical check after rebuilding, run `GGML_RPC_ALLREDUCE=nccl-exch
 
 ### Experimental SM12x Q2_K MoE tile selection
 
-`GGML_CUDA_Q2_K_MOE_NCOLS=-1` selects Q2_K MoE tile width using the average routed tokens per expert on SM120/121. Values `32`, `64`, and `128` instead supply a fixed token-column target to the existing tile selector. Unset or `0` retains the original selection. This affects only MoE batches of at least 32 tokens, keeps the full launch bound for skewed routing, and uses existing kernels and weight layouts. It does not add a compact work queue; narrower tiles can increase empty-block overhead, so compare actual PP before adopting a value.
+By default, Q2_K MoE tile width uses the average routed tokens per expert on SM120/121, equivalent to `GGML_CUDA_Q2_K_MOE_NCOLS=-1`. Values `32`, `64`, and `128` instead supply a fixed token-column target to the existing tile selector. Set `0` to restore the original selection. This affects only MoE batches of at least 32 tokens, keeps the full launch bound for skewed routing, and uses existing kernels and weight layouts. It does not add a compact work queue; narrower tiles can increase empty-block overhead, so compare actual PP when overriding the default.
 
-For RPC execution, rebuild **both RPC workers** from this source and set the variable when restarting them. Setting it only on the client does not change the workers' CUDA kernels. Keep DSpark, Engram overlap, batch, and context settings unchanged. CUDA correctness and GB10 performance must be checked on the workers; a CPU or Metal build does not validate this path.
+For RPC execution, rebuild and restart **both RPC workers** from this source. No environment variable is needed for the default; set overrides on both workers. Setting it only on the client does not change the workers' CUDA kernels. Keep DSpark, Engram overlap, batch, and context settings unchanged. CUDA correctness and GB10 performance must be checked on the workers; a CPU or Metal build does not validate this path.
 
 ## Investigating slow prompt processing
 

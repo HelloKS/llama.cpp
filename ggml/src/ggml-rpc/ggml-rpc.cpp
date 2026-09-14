@@ -3030,7 +3030,7 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         return nullptr;
     }
     const char * selected = std::getenv("GGML_RPC_ALLREDUCE");
-    const std::string mode = selected ? selected : "pairwise";
+    const std::string mode = selected ? selected : "auto";
     if (mode != "pairwise" && mode != "auto" && mode != "nccl-exchange" && mode != "nccl-f32") {
         GGML_ABORT("Unknown GGML_RPC_ALLREDUCE value: %s", mode.c_str());
     }

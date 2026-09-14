@@ -257,7 +257,7 @@ void ggml_cuda_mul_mat_q(
         static const int moe_ncols = [] {
             const char * value = std::getenv("GGML_CUDA_Q2_K_MOE_NCOLS");
             if (!value) {
-                return 0;
+                return -1;
             }
             char * end = nullptr;
             const long parsed = std::strtol(value, &end, 10);
