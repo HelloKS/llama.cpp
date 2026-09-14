@@ -63,6 +63,16 @@ Run the benchmark once with `LLAMA_DSV41_CED=0` and once with the default, with 
 
 Large CPU row gathers request multiple graph threads, with one task per 256 requested rows up to the configured CPU thread count. Small gathers alone keep the graph single-threaded; other operations in the same graph can require more threads. This allows lazy Engram page reads to run concurrently during prefill without increasing the physical microbatch or allocating a second table cache. It still uses the OS page cache; more concurrent reads can increase the resident working set. Keep `-b` and `-ub` at values that leave room for DSpark loading.
 
+### Explicit Engram reads
+
+Use `--lazy-mode on-direct` to read Engram rows with the shared reader from [PR #28136](https://github.com/ggml-org/llama.cpp/pull/28136). This fork extends its Qwen and Gemma PLE support to DeepSeek-V4.1. Keep the rest of the server command, including `-b` and `-ub`, unchanged when comparing it with `--lazy-mode on`.
+
+The reader sorts row requests, reuses duplicate rows within each worker's chunk, and uses concurrent buffered `pread()` calls. It dequantizes the rows to F32 before uploading each Engram input. Hashing, token history, CED, and DSpark feature handling are unchanged. This is an exact replacement for the Engram gather, not an additional approximation.
+
+Startup must report `direct reads enabled for blk.N.engram_embd.weight` for each Engram table. If the file cannot be reopened or the platform lacks support, that table uses the existing mapped reads. Windows currently uses this fallback.
+
+Despite its name, `on-direct` does not use `O_DIRECT` or bypass the OS page cache. It avoids mapped-page faults in the graph by reading the requested rows explicitly. Each Engram input also keeps an F32 host staging buffer of `n_tokens * hash_heads * head_dim * sizeof(float)` bytes; it does not cache the full table. Measure cold and warm real-text requests with DSpark enabled to check both throughput and memory headroom.
+
 ## Investigating slow prompt processing
 
 Throughput alone does not distinguish GPU kernels, CPU work, page faults, or RPC waits. The CPU compute-buffer size also does not show how much time runs on the CPU. Collect the following with no other inference requests running.

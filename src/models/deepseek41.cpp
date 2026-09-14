@@ -146,7 +146,8 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
-    GGML_UNUSED(ml);
+
+    engram_readers.resize(n_layer, nullptr);
 
     if (engram_token_map.size() != (size_t) n_vocab) {
         throw std::runtime_error("DeepSeek-V4.1 Engram token map size does not match vocabulary size");
@@ -216,6 +217,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             layer.engram_embd =
                 create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", il),
                               { hparams.dsv41_engram_head_dim, hparams.dsv41_engram_table_rows[il] }, TENSOR_READ_LAZY);
+            engram_readers[il] = load_lazy_reader(ml, tn(LLM_TENSOR_ENGRAM_EMBD, "weight", il).str().c_str(), layer.engram_embd);
             layer.engram_wkv = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV, "weight", il),
                                              { hash_heads * hparams.dsv41_engram_head_dim, n_embd * (hc + 1) }, 0);
             layer.engram_q   = create_tensor(tn(LLM_TENSOR_ENGRAM_Q, "weight", il), { n_embd, hc }, 0);
@@ -245,10 +247,12 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
   public:
     llm_graph_input_dsv41_engram(const llama_model_deepseek41 & model,
                                  const llama_kv_cache_dsv4_raw_context * mctx,
-                                 uint32_t                       module) :
+                                 uint32_t                       module,
+                                 const llama_lazy_reader * reader) :
         model(model),
         mctx(mctx),
-        module(module) {}
+        module(module),
+        reader(reader) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         const auto &             hp              = model.hparams;
@@ -287,19 +291,29 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
             }
         }
 
-        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * sizeof(int32_t));
+        if (reader) {
+            staging.resize(idx.size() * reader->head_dim);
+            reader->gather(idx.data(), idx.size(), staging.data());
+            ggml_backend_tensor_set(data, staging.data(), 0, staging.size() * sizeof(float));
+        } else {
+            ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * sizeof(int32_t));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
-        return rows->ne[0] == (int64_t) model.hparams.dsv41_engram_head_count *
-                                  (model.hparams.dsv41_engram_max_ngram_size - 1) * params.ubatch.n_tokens;
+        const int64_t n = (int64_t) model.hparams.dsv41_engram_head_count *
+                         (model.hparams.dsv41_engram_max_ngram_size - 1) * params.ubatch.n_tokens;
+        return reader ? data->ne[1] == n : rows->ne[0] == n;
     }
 
     ggml_tensor *                  rows = nullptr;
+    ggml_tensor *                  data = nullptr;
     const llama_model_deepseek41 & model;
     const llama_kv_cache_dsv4_raw_context * mctx;
     const uint32_t                 module;
+    const llama_lazy_reader *      reader;
+    std::vector<float>             staging;
 };
 
 static uint32_t dsv41_replay_skip(const llm_graph_params & params) {
@@ -619,13 +633,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         if (ubatch.token && hparams.dsv41_engram_layers.test(il)) {
             auto engram_inp =
-                std::make_unique<llm_graph_input_dsv41_engram>(model, inp_attn->mctx->get_raw(), engram_module++);
-            engram_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hash_heads * nt);
-            ggml_set_input(engram_inp->rows);
-            ggml_tensor * rows = engram_inp->rows;
+                std::make_unique<llm_graph_input_dsv41_engram>(model, inp_attn->mctx->get_raw(), engram_module++, model.engram_readers[il]);
+            ggml_tensor * emb;
+            if (engram_inp->reader) {
+                engram_inp->data = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.dsv41_engram_head_dim, hash_heads * nt);
+                ggml_set_input(engram_inp->data);
+                emb = engram_inp->data;
+            } else {
+                engram_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hash_heads * nt);
+                ggml_set_input(engram_inp->rows);
+                emb = ggml_get_rows(ctx0, layer.engram_embd, engram_inp->rows);
+            }
             res->add_input(std::move(engram_inp));
 
-            ggml_tensor * emb   = ggml_get_rows(ctx0, layer.engram_embd, rows);
             emb                 = ggml_reshape_2d(ctx0, emb, hash_heads * hparams.dsv41_engram_head_dim, nt);
             ggml_tensor * kv    = build_lora_mm(layer.engram_wkv, emb);
             kv                  = ggml_reshape_3d(ctx0, kv, n_embd, hc + 1, nt);
