@@ -2955,13 +2955,25 @@ struct ggml_backend_rpc_comm_context {
         std::shared_ptr<rpc_dispatcher> dispatcher;
     };
     std::vector<rank_info> ranks;
+    std::string mode;
+    size_t users = 1;
 };
+
+static std::mutex rpc_comm_mutex;
+static std::vector<ggml_backend_rpc_comm_context *> rpc_comms;
 
 static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
     ggml_backend_rpc_comm_context * comm_ctx = (ggml_backend_rpc_comm_context *) comm_ctx_v;
     if (comm_ctx == nullptr) {
         return;
     }
+    std::lock_guard<std::mutex> lock(rpc_comm_mutex);
+    if (--comm_ctx->users != 0) {
+        return;
+    }
+    auto it = std::find(rpc_comms.begin(), rpc_comms.end(), comm_ctx);
+    GGML_ASSERT(it != rpc_comms.end());
+    rpc_comms.erase(it);
     std::vector<rpc_msg_comm_init_rsp> responses(comm_ctx->ranks.size());
     for (size_t i = 0; i < comm_ctx->ranks.size(); i++) {
         const auto & rank = comm_ctx->ranks[i];
@@ -3061,6 +3073,30 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         ranks.push_back({rpc_ctx->endpoint, rpc_ctx->device, rpc_ctx->dispatcher});
     }
 
+    // Each worker connection has one communicator per device, shared by model contexts.
+    std::lock_guard<std::mutex> lock(rpc_comm_mutex);
+    for (auto * comm : rpc_comms) {
+        const auto same_rank = [](const auto & a, const auto & b) {
+            return a.dispatcher == b.dispatcher && a.device == b.device;
+        };
+        if (comm->mode == mode && comm->ranks.size() == ranks.size() &&
+            std::equal(ranks.begin(), ranks.end(), comm->ranks.begin(), same_rank)) {
+            ++comm->users;
+            GGML_LOG_INFO("%s: reusing communicator (%s <-> %s), users = %zu\n", __func__,
+                ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str(), comm->users);
+            return comm;
+        }
+        for (const auto & rank : ranks) {
+            for (const auto & active : comm->ranks) {
+                if (same_rank(rank, active)) {
+                    GGML_LOG_WARN("%s: device %u on %s already belongs to a different communicator configuration\n",
+                        __func__, rank.device, rank.endpoint.c_str());
+                    return unsupported();
+                }
+            }
+        }
+    }
+
     // rank 1 connects to rank 0 on its serving host; endpoints must be mutually reachable
     // (e.g. do not bind the servers to 127.0.0.1 when they run on different machines)
     std::string host0;
@@ -3115,7 +3151,9 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     }
     GGML_LOG_INFO("%s: pairwise communicator initialized (%s <-> %s)\n", __func__,
                   ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str());
-    return new ggml_backend_rpc_comm_context{std::move(ranks)};
+    auto * comm = new ggml_backend_rpc_comm_context{std::move(ranks), mode};
+    rpc_comms.push_back(comm);
+    return comm;
 }
 
 static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {

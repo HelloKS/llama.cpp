@@ -98,10 +98,17 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
     ggml_backend_t backends[] = {backend_a, backend_b};
     void * comm = comm_init(backends, 2);
     GGML_ASSERT(comm);
+    ggml_backend_t draft_backends[] = {
+        ggml_backend_dev_init(ggml_backend_get_device(backend_a), nullptr),
+        ggml_backend_dev_init(ggml_backend_get_device(backend_b), nullptr),
+    };
+    GGML_ASSERT(draft_backends[0] && draft_backends[1]);
 
     const char * mode = std::getenv("GGML_RPC_ALLREDUCE");
     const bool fp32 = mode && std::strcmp(mode, "nccl-f32") == 0;
     for (int64_t n : {16, 32767, 32768, 65536}) {
+        void * draft_comm = comm_init(draft_backends, 2);
+        GGML_ASSERT(draft_comm);
         ggml_context * contexts[2];
         ggml_backend_buffer_t buffers[2];
         ggml_tensor * inputs[2];
@@ -123,6 +130,15 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
         std::vector<float> values[2] = {std::vector<float>(n), std::vector<float>(n)};
         std::vector<float> result(n);
         for (int iteration = 0; iteration < 3; ++iteration) {
+            if (iteration == 2) {
+                // Either context can be freed while the other still uses the workers.
+                if (n % 2 == 0) {
+                    comm_free(comm);
+                    comm = draft_comm;
+                } else {
+                    comm_free(draft_comm);
+                }
+            }
             for (int rank = 0; rank < 2; ++rank) {
                 for (int64_t i = 0; i < n; ++i) {
                     values[rank][i] = i % 8 + iteration + rank + 0.003f*(i % 7);
@@ -130,7 +146,7 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
                 ggml_backend_tensor_set_async(backends[rank], inputs[rank], values[rank].data(), 0, n*sizeof(float));
                 GGML_ASSERT(ggml_backend_graph_compute_async(backends[rank], graphs[rank]) == GGML_STATUS_SUCCESS);
             }
-            GGML_ASSERT(allreduce(comm, outputs));
+            GGML_ASSERT(allreduce(iteration == 1 ? draft_comm : comm, outputs));
             for (int rank = 0; rank < 2; ++rank) {
                 ggml_backend_tensor_get_async(backends[rank], outputs[rank], result.data(), 0, n*sizeof(float));
                 ggml_backend_synchronize(backends[rank]);
@@ -150,6 +166,8 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
         }
     }
     comm_free(comm);
+    ggml_backend_free(draft_backends[1]);
+    ggml_backend_free(draft_backends[0]);
 }
 
 int main(int argc, char ** argv) {
@@ -189,6 +207,7 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(total_mem > 0);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+    test_allreduce(backend_a, backend_b);
     test_allreduce(backend_a, backend_b);
     test_deferred_inputs(backend_a, backend_b, false);
     test_deferred_inputs(backend_a, backend_b, true);

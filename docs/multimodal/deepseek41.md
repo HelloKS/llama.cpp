@@ -106,6 +106,8 @@ All modes retain the current pairwise route for smaller reductions. `GGML_RPC_NO
 
 Startup reports the selected NCCL mode and library version. Set `NCCL_DEBUG=INFO` and `NCCL_DEBUG_SUBSYS=INIT,NET` on both workers to verify that NCCL selects the ConnectX-7 RDMA path. Existing RPC RDMA negotiation alone does not prove the NCCL transport selection. Spark does not support conventional GPUDirect RDMA to CUDA allocations; use NCCL's supported network staging path rather than forcing GPUDirect settings.
 
+Target and draft contexts on the same ordered RPC devices share the communicator. Loading DSpark reports `reusing communicator` instead of initializing NCCL again. The client releases the worker communicator only after its last context is freed.
+
 Communication uses the worker's CUDA compute stream and reusable scratch buffers. A progress watchdog terminates the worker on an asynchronous failure or 60 seconds without completion progress. Restart both workers and the client after such a failure; the implementation does not replay an in-flight reduction through a fallback. The timeout also applies to NCCL initialization, but does not change the existing pairwise socket bootstrap timeout behavior.
 
 For a direct numerical check after rebuilding, run `GGML_RPC_ALLREDUCE=nccl-exchange build/bin/test-rpc-multi-server SPARK_A_RDMA_IP:50052 SPARK_B_RDMA_IP:50052` against idle workers, then repeat with `nccl-f32`. This checks fractional inputs, both sides of the reduction threshold, graph reuse, and deferred input copies. Do not run this test concurrently with the model server. CPU/Metal builds and local CPU RPC tests do not validate CUDA/NCCL execution or prove a PP gain on GB10.
