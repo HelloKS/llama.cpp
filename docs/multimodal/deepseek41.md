@@ -91,6 +91,12 @@ Keep context and batch sizes unchanged for the comparison. CED and `--lazy-mode 
 
 Large F32 partials are sent as BF16 and restored before addition; this introduces rounding relative to F32 reductions. The implementation still uses host staging and synchronization, not NCCL or GPU-direct transfers. Test target-only output first, then DSpark, including retained features, cache reuse, and memory headroom. Local TCP checks do not establish GB10/RDMA performance or full DSpark compatibility.
 
+### Experimental SM12x Q2_K MoE tile selection
+
+`GGML_CUDA_Q2_K_MOE_NCOLS=-1` selects Q2_K MoE tile width using the average routed tokens per expert on SM120/121. Values `32`, `64`, and `128` instead supply a fixed token-column target to the existing tile selector. Unset or `0` retains the original selection. This affects only MoE batches of at least 32 tokens, keeps the full launch bound for skewed routing, and uses existing kernels and weight layouts. It does not add a compact work queue; narrower tiles can increase empty-block overhead, so compare actual PP before adopting a value.
+
+For RPC execution, rebuild **both RPC workers** from this source and set the variable when restarting them. Setting it only on the client does not change the workers' CUDA kernels. Keep DSpark, Engram overlap, batch, and context settings unchanged. CUDA correctness and GB10 performance must be checked on the workers; a CPU or Metal build does not validate this path.
+
 ## Investigating slow prompt processing
 
 Throughput alone does not distinguish GPU kernels, CPU work, page faults, or RPC waits. The CPU compute-buffer size also does not show how much time runs on the CPU. Collect the following with no other inference requests running.

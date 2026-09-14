@@ -4,6 +4,7 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -249,6 +250,23 @@ void ggml_cuda_mul_mat_q(
     int64_t ncols_opt = ne12;
     if (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+    }
+
+    if (src0->type == GGML_TYPE_Q2_K && ne12 >= 32 &&
+        cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN) {
+        static const int moe_ncols = [] {
+            const char * value = std::getenv("GGML_CUDA_Q2_K_MOE_NCOLS");
+            if (!value) {
+                return 0;
+            }
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            return end != value && *end == '\0' && (parsed == -1 || parsed == 32 || parsed == 64 || parsed == 128) ? int(parsed) : 0;
+        }();
+        // Keep the launch bound unchanged so skewed expert routing remains valid.
+        if (moe_ncols != 0) {
+            ncols_opt = moe_ncols == -1 ? (ne12*n_expert_used + ne02 - 1) / ne02 : moe_ncols;
+        }
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
