@@ -75,6 +75,45 @@ Despite its name, `on-direct` does not use `O_DIRECT` or bypass the OS page cach
 
 For prefill microbatches of at least 32 tokens, direct Engram reads start during input preparation and finish before each table's first consumer. Earlier layers can execute while reusable reader workers gather the rows. This is enabled by default, including with RPC tensor splitting, and reuses the existing F32 staging buffers. Set `LLAMA_DSV41_ENGRAM_ASYNC=0` on `llama-server` to use synchronous gathering for comparison. Small decode batches and unsupported graph paths keep synchronous gathering. No batch or context increase is required.
 
+### Experimental Engram page grouping
+
+Set `LLAMA_DSV41_ENGRAM_PAGE_GROUP=1` on the client with `--lazy-mode on-direct` to group sorted row requests whose file pages overlap. Groups are assigned whole to reader workers, so a worker boundary does not split duplicate requests within a group. Each read spans the first requested row through the last requested row, with a 64 KiB span limit for Engram rows. File-page boundaries include the tensor's actual file offset. The last group does not read beyond the tensor. Rows are dequantized and restored to their original output order.
+
+This is off by default. It uses the host OS page size, the existing reader pool and OS page cache, and at most 64 KiB of read scratch per active worker. It does not add a persistent table cache. Grouping also applies to small decode gathers when enabled; measure both PP and TG. It can reduce read calls when requested rows share pages, but cannot remove the physical page-read cost of isolated rows. Reading gaps between rows can increase application read bytes even when the same storage pages are touched.
+
+Rebuild and restart the client. Existing workers can remain running: this change does not alter the RPC protocol or worker kernels. Startup must report `Engram page grouping enabled` for each direct-read table. Compare the following client settings with identical prompts, sampling, context, draft length, batch size and worker settings:
+
+| Run | `LLAMA_DSV41_ENGRAM_PAGE_GROUP` | `LLAMA_PROFILE_PIPELINE` |
+| --- | --- | --- |
+| Throughput baseline | `0` | `0` |
+| Grouped throughput | `1` | `0` |
+| Baseline diagnostics | `0` | `1` |
+| Grouped diagnostics | `1` | `1` |
+
+Record cold and warm requests separately without dropping the system page cache. Use delivered tokens/s and acceptance for throughput comparisons. Diagnostic runs add timers, log output and synchronization; do not treat their throughput as the uninstrumented result.
+
+### Pipeline diagnostics
+
+`LLAMA_PROFILE_PIPELINE=1` on the client prints per-batch `pipeline:` records at info level. It is disabled by default. The server separates prompt tokens from generation/verification tokens using the `prompt` count, including mixed batches.
+
+| Record | Meaning |
+| --- | --- |
+| `engram` | Per-table row count, page size (`0` means row reads), actual `pread` calls and returned bytes, summed read-call time, and wall time from gather submission to completion. `submit_ms + wait_ms` measures exposed gathering work; `upload_ms` measures the blocking staging upload call. |
+| `target_features` | Bytes read from target backends into client memory and elapsed read time, after synchronizing preceding target work. |
+| `draft_features` | Per-sequence client feature gathering/copy time and draft KV injection time, including draft synchronization. |
+| `draft` | Wall time inside each speculative implementation's draft call. |
+| `batch` | Target `llama_decode` time, its following synchronization, and speculative feature-processing time. `prompt=0` identifies generation/verification batches. |
+
+These records are nested, not additive: Engram and target-feature reads are included in target decode; draft-feature work is included in `spec_process_ms`. Summed reader-thread time can exceed elapsed time because reads overlap. Reader `bytes` counts data returned by `pread`, not physical storage traffic; compare it with `pidstat -d` or `iostat` to measure page-read amplification. Target decode still combines graph preparation, kernels, RPC and backend waits. These timings do not replace a CUDA timeline for separating those components. Synchronization in diagnostic mode prevents completed injection and target-feature reads from being charged to the next phase, but can change normal overlap.
+
+The existing architecture test executable also checks the reader independently:
+
+```sh
+build/bin/test-llama-archs --lazy-reader
+```
+
+It compares row and page gathers against dequantized reference data for F32, F16, BF16, Q8_0 and Q2_K, with 4 KiB and 16 KiB pages, unaligned tensor offsets, duplicate and scattered rows, multiple workers, asynchronous replay, and truncated-file error recovery. This is a correctness test, not a storage throughput benchmark.
+
 ### Tensor splitting over two RPC workers
 
 This fork includes [PR #26610](https://github.com/ggml-org/llama.cpp/pull/26610). Its pairwise reduction requires exactly two RPC devices on separate endpoints. Run an RPC worker on each Spark, including the Spark that runs `llama-server`, and select only the two RPC devices for the target model. A local CUDA device plus one RPC device uses the generic reduction path.

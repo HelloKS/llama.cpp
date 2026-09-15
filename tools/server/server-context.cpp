@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-impl.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -3671,17 +3672,29 @@ private:
         }
 
         bool has_output = false;
+        int32_t n_prompt = 0;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            n_prompt += batch.tokens[i].is_prompt;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool profile = llama_profile_pipeline();
+        int64_t target_decode_us = 0;
+        int64_t target_sync_us = 0;
+        int64_t spec_process_us = 0;
         queue_tasks.yield_to_queue([&]() {
+            const int64_t start = profile ? ggml_time_us() : 0;
             ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
+            const int64_t decoded = profile ? ggml_time_us() : 0;
+            if (ret == 0 && (has_output || profile)) {
                 llama_synchronize(ctx_tgt);
+            }
+            if (profile) {
+                target_decode_us = decoded - start;
+                target_sync_us = ggml_time_us() - decoded;
             }
         });
 
@@ -3744,7 +3757,11 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                const int64_t start = profile ? ggml_time_us() : 0;
                 ok = common_speculative_process(spec.get(), batch_view);
+                if (profile) {
+                    spec_process_us = ggml_time_us() - start;
+                }
             });
 
             if (!ok) {
@@ -3753,6 +3770,11 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+        }
+
+        if (profile) {
+            SRV_INF("pipeline: batch tokens=%d prompt=%d target_decode_ms=%.3f target_sync_ms=%.3f spec_process_ms=%.3f\n",
+                    batch_view.n_tokens, n_prompt, target_decode_us / 1000.0, target_sync_us / 1000.0, spec_process_us / 1000.0);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

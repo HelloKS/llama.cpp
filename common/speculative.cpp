@@ -11,6 +11,7 @@
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-impl.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1155,6 +1156,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
+                const bool profile = llama_profile_pipeline();
+                const int64_t copy_start = profile ? ggml_time_us() : 0;
                 batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
@@ -1168,6 +1171,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                const int64_t copy_end = profile ? ggml_time_us() : 0;
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
                     batch_inject.pos[i] = p;
@@ -1180,7 +1184,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                const int64_t inject_start = profile ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                if (profile && rc == 0) {
+                    llama_synchronize(ctx_dft);
+                    SPC_INF("pipeline: draft_features seq=%d tokens=%d copy_ms=%.3f inject_ms=%.3f\n",
+                            seq_id, n_chunk, (copy_end - copy_start) / 1000.0, (ggml_time_us() - inject_start) / 1000.0);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -2843,7 +2853,12 @@ void common_speculative_draft(common_speculative * spec) {
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            const int64_t start = llama_profile_pipeline() ? ggml_time_us() : 0;
             impl->draft(dparams);
+            if (llama_profile_pipeline()) {
+                SPC_INF("pipeline: draft type=%s wall_ms=%.3f\n",
+                        common_speculative_type_to_str(impl->type).c_str(), (ggml_time_us() - start) / 1000.0);
+            }
             impl->n_call_draft++;
         }
 

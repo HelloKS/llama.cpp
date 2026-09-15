@@ -2237,6 +2237,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    const bool profile = llama_profile_pipeline() && std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; });
+    if (profile) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    const int64_t start = profile ? ggml_time_us() : 0;
+    size_t read_bytes = 0;
     for (uint32_t i = 0; i < res->n_layer_inp_prefix; ++i) {
         embd_layer_inp_valid.at(token_offset + i) = false;
     }
@@ -2266,6 +2272,12 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        read_bytes += nbytes;
+    }
+    if (profile && read_bytes) {
+        ggml_backend_sched_synchronize(sched.get());
+        LLAMA_LOG_INFO("pipeline: target_features tokens=%zu bytes=%zu read_ms=%.3f\n",
+                n_tokens, read_bytes, (ggml_time_us() - start) / 1000.0);
     }
 }
 

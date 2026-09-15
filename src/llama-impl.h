@@ -3,8 +3,17 @@
 #include "ggml.h" // for ggml_log_level
 
 #include <string>
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
+
+inline bool llama_profile_pipeline() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_PROFILE_PIPELINE");
+        return value && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
 
 #ifdef __GNUC__
 #    if defined(__MINGW32__) && !defined(__clang__)

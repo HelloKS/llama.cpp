@@ -11,6 +11,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-lazy-reader.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -22,6 +23,103 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+static int test_lazy_reader() {
+    constexpr int64_t dim = 256;
+    constexpr int64_t n_rows = 1025;
+    std::mt19937 rng(17);
+    for (const auto type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K }) {
+        const size_t row_size = ggml_row_size(type, dim);
+        std::vector<float> values(n_rows * dim);
+        for (auto & value : values) {
+            value = (int(rng() % 2001) - 1000) / 1000.0f;
+        }
+        std::vector<uint8_t> packed(n_rows * row_size);
+        GGML_ASSERT(ggml_quantize_chunk(type, values.data(), packed.data(), 0, n_rows, dim, nullptr) == packed.size());
+        std::vector<float> reference(values.size());
+        if (type == GGML_TYPE_F32) {
+            reference = values;
+        } else {
+            ggml_get_type_traits(type)->to_float(packed.data(), reference.data(), values.size());
+        }
+        for (size_t base : { size_t(32), size_t(4092) }) {
+            for (int threads : { 1, 4 }) {
+                for (size_t page_size : { size_t(0), size_t(4096), size_t(16384) }) {
+                    std::unique_ptr<FILE, decltype(&fclose)> file(tmpfile(), fclose);
+                    GGML_ASSERT(file);
+                    std::vector<uint8_t> prefix(base, 0);
+                    GGML_ASSERT(fwrite(prefix.data(), 1, base, file.get()) == base);
+                    GGML_ASSERT(fwrite(packed.data(), 1, packed.size(), file.get()) == packed.size());
+                    GGML_ASSERT(fflush(file.get()) == 0);
+                    const int fd = dup(fileno(file.get()));
+                    GGML_ASSERT(fd >= 0);
+                    llama_lazy_reader reader(fd, base, row_size, n_rows, threads, type, dim, page_size);
+                    for (int pattern = 0; pattern < 5; ++pattern) {
+                        std::vector<int32_t> rows;
+                        if (pattern == 0) {
+                            for (int32_t i = 0; i < n_rows; ++i) {
+                                rows.push_back(i);
+                                rows.push_back(i);
+                            }
+                        } else if (pattern == 1) {
+                            for (int i = 0; i < 200; ++i) {
+                                rows.push_back(rng() % n_rows);
+                            }
+                        } else if (pattern == 2) {
+                            rows.assign(256, n_rows - 1);
+                        } else if (pattern == 3) {
+                            rows.push_back(n_rows - 1);
+                        }
+                        std::shuffle(rows.begin(), rows.end(), rng);
+                        const auto expected_rows = rows;
+                        std::vector<float> actual(rows.size() * dim + 16, 12345.0f);
+                        llama_lazy_read_stats stats;
+                        auto done = reader.gather_async(rows.data(), rows.size(), actual.data(), &stats);
+                        std::fill(rows.begin(), rows.end(), 0);
+                        done.get();
+                        for (size_t i = 0; i < expected_rows.size(); ++i) {
+                            GGML_ASSERT(memcmp(actual.data() + i * dim, reference.data() + expected_rows[i] * dim, dim * sizeof(float)) == 0);
+                        }
+                        for (size_t i = expected_rows.size() * dim; i < actual.size(); ++i) {
+                            GGML_ASSERT(actual[i] == 12345.0f);
+                        }
+                        if (pattern == 0) {
+                            GGML_ASSERT(stats.calls > 0);
+                            GGML_ASSERT(page_size ? stats.calls < n_rows : stats.calls >= n_rows);
+                            GGML_ASSERT(page_size ? stats.bytes == packed.size() : stats.bytes >= packed.size());
+                        }
+                        if (pattern == 2 && page_size) {
+                            GGML_ASSERT(stats.calls == 1 && stats.bytes == row_size);
+                        }
+                        if (pattern == 4) {
+                            GGML_ASSERT(stats.calls == 0 && stats.bytes == 0);
+                        }
+                    }
+                    GGML_ASSERT(ftruncate(fd, base + packed.size() - 1) == 0);
+                    std::vector<int32_t> rows(256, n_rows - 1);
+                    for (size_t i = 0; i < rows.size(); i += 2) {
+                        rows[i] = 0;
+                    }
+                    std::vector<float> actual(rows.size() * dim);
+                    bool failed = false;
+                    try {
+                        reader.gather_async(rows.data(), rows.size(), actual.data()).get();
+                    } catch (const std::runtime_error &) {
+                        failed = true;
+                    }
+                    GGML_ASSERT(failed);
+                    rows.assign(256, 0);
+                    reader.gather(rows.data(), rows.size(), actual.data());
+                    GGML_ASSERT(memcmp(actual.data(), reference.data(), dim * sizeof(float)) == 0);
+                }
+            }
+        }
+    }
+    printf("lazy-reader: row/page gathers, quantized rows, page crossings, async replay and EOF recovery passed\n");
+    return 0;
+}
+#endif
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -66,7 +164,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [--lazy-reader] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -898,6 +996,12 @@ int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+
+#ifndef _WIN32
+    if (argc == 2 && strcmp(argv[1], "--lazy-reader") == 0) {
+        return test_lazy_reader();
+    }
+#endif
 
     std::random_device rd;
 

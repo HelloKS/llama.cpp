@@ -1906,11 +1906,23 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     // on NVMe and stays sane on smaller machines
     const int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
 
+    size_t page_size = 0;
+    const char * page_env = std::getenv("LLAMA_DSV41_ENGRAM_PAGE_GROUP");
+    if (arch == LLM_ARCH_DEEPSEEK41 && page_env && std::atoi(page_env) != 0) {
+        const long size = ::sysconf(_SC_PAGESIZE);
+        if (size > 0) {
+            page_size = size;
+        }
+    }
     auto reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
-            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0], page_size);
 
     LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
             __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads);
+    if (page_size) {
+        LLAMA_LOG_INFO("%s: Engram page grouping enabled for %s (page = %zu bytes, span limit = 65536 bytes)\n",
+                __func__, tensor_name, page_size);
+    }
 
     lazy_readers[tensor_name] = std::move(reader);
     return lazy_readers.at(tensor_name).get();

@@ -302,11 +302,15 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
 
         if (reader) {
             staging.resize(idx.size() * reader->head_dim);
+            const bool profile = llama_profile_pipeline();
+            const int64_t start = profile ? ggml_time_us() : 0;
             if (consumer) {
-                pending = reader->gather_async(idx.data(), idx.size(), staging.data());
+                pending = reader->gather_async(idx.data(), idx.size(), staging.data(), profile ? &read_stats : nullptr);
+                submit_us = profile ? ggml_time_us() - start : 0;
             } else {
-                reader->gather(idx.data(), idx.size(), staging.data());
-                ggml_backend_tensor_set(data, staging.data(), 0, staging.size() * sizeof(float));
+                reader->gather(idx.data(), idx.size(), staging.data(), profile ? &read_stats : nullptr);
+                submit_us = 0;
+                upload(profile ? ggml_time_us() - start : 0);
             }
         } else {
             ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * sizeof(int32_t));
@@ -317,8 +321,21 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
 
     void prepare() override {
         GGML_ASSERT(pending.valid());
+        const int64_t start = llama_profile_pipeline() ? ggml_time_us() : 0;
         pending.get();
+        upload(llama_profile_pipeline() ? ggml_time_us() - start : 0);
+    }
+
+    void upload(int64_t wait_us) {
+        const int64_t start = llama_profile_pipeline() ? ggml_time_us() : 0;
         ggml_backend_tensor_set(data, staging.data(), 0, staging.size() * sizeof(float));
+        if (llama_profile_pipeline()) {
+            LLAMA_LOG_INFO("pipeline: engram module=%u rows=%zu page_size=%zu calls=%llu bytes=%llu read_sum_ms=%.3f read_wall_ms=%.3f submit_ms=%.3f wait_ms=%.3f upload_ms=%.3f async=%d\n",
+                    module, staging.size() / (size_t) reader->head_dim, reader->page_size,
+                    (unsigned long long) read_stats.calls, (unsigned long long) read_stats.bytes,
+                    read_stats.read_us / 1000.0, read_stats.total_us / 1000.0, submit_us / 1000.0,
+                    wait_us / 1000.0, (ggml_time_us() - start) / 1000.0, consumer != nullptr);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -337,6 +354,8 @@ class llm_graph_input_dsv41_engram : public llm_graph_input_i {
     const llama_lazy_reader *      reader;
     std::vector<float>             staging;
     std::shared_future<void>        pending;
+    llama_lazy_read_stats           read_stats;
+    int64_t                        submit_us = 0;
 };
 
 static uint32_t dsv41_replay_skip(const llm_graph_params & params) {
