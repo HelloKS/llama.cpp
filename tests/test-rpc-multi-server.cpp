@@ -4,6 +4,7 @@
 #include "ggml-rpc.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <vector>
 #include <cstdlib>
 #include <cstring>
@@ -210,8 +211,11 @@ static void test_meta_graph_reuse(ggml_backend_t backend_a, ggml_backend_t backe
     }
 
     // Alternate graph shapes and input contents across more than two meta rebuilds.
-    for (int iteration = 0; iteration < 12; ++iteration) {
+    for (int iteration = 0; iteration < 24; ++iteration) {
         const int i = iteration % 3;
+        if (iteration >= 12) {
+            graphs[i]->uid = ggml_graph_next_uid();
+        }
         std::vector<float> values(ggml_nelements(inputs[i]), iteration - 2.0f);
         ggml_backend_tensor_set_async(backend, inputs[i], values.data(), 0, values.size()*sizeof(float));
         GGML_ASSERT(ggml_backend_graph_compute_async(backend, graphs[i]) == GGML_STATUS_SUCCESS);
@@ -229,6 +233,57 @@ static void test_meta_graph_reuse(ggml_backend_t backend_a, ggml_backend_t backe
     }
     ggml_backend_buffer_free(input_buffer);
     ggml_free(input_ctx);
+}
+
+static void test_graph_definition_cache(ggml_backend_t backend) {
+    for (int allocation = 0; allocation < 2; ++allocation) {
+        ggml_init_params params = {8*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true};
+        auto ctx = ggml_init(params);
+        auto a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        auto b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        auto scaled = ggml_scale(ctx, a, 2.0f);
+        auto sum = ggml_add(ctx, scaled, b);
+        auto alternate = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        GGML_ASSERT(buffer);
+
+        for (int iteration = 0; iteration < 16; ++iteration) {
+            std::vector<float> values(16, iteration + 1.0f);
+            ggml_backend_tensor_set(a, values.data(), 0, values.size()*sizeof(float));
+            std::fill(values.begin(), values.end(), 10.0f + allocation);
+            ggml_backend_tensor_set(b, values.data(), 0, values.size()*sizeof(float));
+
+            // Rebuilt tensor objects retain buffers but can change parameters, edges, or output addresses.
+            auto copy_ctx = ggml_init(params);
+            ggml_tensor * nodes[4];
+            ggml_tensor * originals[] = {a, b, scaled, sum};
+            for (int i = 0; i < 4; ++i) {
+                nodes[i] = ggml_new_tensor_1d(copy_ctx, GGML_TYPE_F32, 16);
+                *nodes[i] = *originals[i];
+            }
+            const bool swap = iteration % 4 == 2;
+            const float factor = iteration % 4 == 1 ? 3.0f : 2.0f;
+            nodes[2]->src[0] = nodes[swap ? 1 : 0];
+            ggml_set_op_params_f32(nodes[2], 0, factor);
+            nodes[3]->src[0] = nodes[2];
+            nodes[3]->src[1] = nodes[swap ? 0 : 1];
+            if (iteration % 4 == 3) {
+                nodes[3]->data = alternate->data;
+            }
+            auto graph = ggml_new_graph_custom(copy_ctx, 8, false);
+            ggml_build_forward_expand(graph, nodes[3]);
+            graph->uid = iteration >= 12 ? 0 : ggml_graph_next_uid();
+            GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(nodes[3], values.data(), 0, values.size()*sizeof(float));
+            const float expected = swap ? factor*(10 + allocation) + iteration + 1 : factor*(iteration + 1) + 10 + allocation;
+            for (float value : values) {
+                GGML_ASSERT(value == expected);
+            }
+            ggml_free(copy_ctx);
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
 }
 
 int main(int argc, char ** argv) {
@@ -271,6 +326,7 @@ int main(int argc, char ** argv) {
     test_allreduce(backend_a, backend_b);
     test_allreduce(backend_a, backend_b);
     test_meta_graph_reuse(backend_a, backend_b);
+    test_graph_definition_cache(backend_a);
     test_deferred_inputs(backend_a, backend_b, false);
     test_deferred_inputs(backend_a, backend_b, true);
     ggml_backend_free(backend_b);
