@@ -4884,7 +4884,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, const std::string & routing = "random") {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4893,10 +4893,13 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
             // ids
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<int32_t> data(t->ne[0]);
+                const int start = routing == "balanced" || (routing == "skewed" && r % 7 == 0) ? (r * 37) % n_mats : 0;
                 for (int i = 0; i < t->ne[0]; i++) {
-                    data[i] = i % n_mats;
+                    data[i] = (i + start) % n_mats;
                 }
-                std::shuffle(data.begin(), data.end(), rng);
+                if (routing == "random") {
+                    std::shuffle(data.begin(), data.end(), rng);
+                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4915,9 +4918,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const std::string routing;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, routing);
     }
 
     double max_nmse_err() override {
@@ -4939,10 +4943,11 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, std::string routing = "random")
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), routing(routing) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(routing == "random" || routing == "balanced" || routing == "skewed");
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4967,7 +4972,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, routing);
     }
 };
 
@@ -9894,6 +9899,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
+    }
+
+    // Q2_K expert tile tails, empty experts, and skewed routing.
+    for (bool b : {false, true}) {
+        for (const char * routing : {"balanced", "skewed"}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 384, 6, b, 128, 2048, 512, routing));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 384, 6, b, 129, 131, 512, routing));
+        }
+        for (int n : {31, 32}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 16, 6, b, 129, n, 512, "skewed"));
+        }
     }
 
     // For issue 27873

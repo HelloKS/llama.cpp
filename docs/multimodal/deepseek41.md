@@ -120,9 +120,23 @@ For a direct numerical check after rebuilding, run `GGML_RPC_ALLREDUCE=nccl-exch
 
 ### Experimental SM12x Q2_K MoE tile selection
 
-By default, Q2_K MoE tile width uses the average routed tokens per expert on SM120/121, equivalent to `GGML_CUDA_Q2_K_MOE_NCOLS=-1`. Values `32`, `64`, and `128` instead supply a fixed token-column target to the existing tile selector. Set `0` to restore the original selection. This affects only MoE batches of at least 32 tokens, keeps the full launch bound for skewed routing, and uses existing kernels and weight layouts. It does not add a compact work queue; narrower tiles can increase empty-block overhead, so compare actual PP when overriding the default.
+By default, Q2_K MoE tile width uses the average routed tokens per expert on SM120/121, equivalent to `GGML_CUDA_Q2_K_MOE_NCOLS=-1`. Values `32`, `64`, and `128` instead supply a fixed token-column target to the existing tile selector. Set `0` to restore the original selection. This affects only MoE batches of at least 32 tokens and retains the existing weight and activation layouts.
 
 For RPC execution, rebuild and restart **both RPC workers** from this source. No environment variable is needed for the default; set overrides on both workers. Setting it only on the client does not change the workers' CUDA kernels. Keep DSpark, Engram overlap, batch, and context settings unchanged. CUDA correctness and GB10 performance must be checked on the workers; a CPU or Metal build does not validate this path.
+
+### Compact Q2_K expert scheduling
+
+On SM120/121, Q2_K MoE MMQ batches of at least 32 tokens use compact scheduling by default. A GPU kernel builds a list of occupied expert/token tiles from the current routing bounds. Persistent blocks process these tiles through the existing Q2_K tile math, using the full reduction dimension per tile. This removes empty expert tiles and stream-K partial-result fixups from this path. Smaller batches and unsupported shapes retain the original scheduler.
+
+The list is rebuilt on the same stream on every execution, including CUDA graph replay. No routing data is read back to the CPU. Scratch storage is bounded by `8 * (total_expert_assignments / tile_width + expert_count) + 4` bytes before allocator rounding; at 2048 tokens, top-6 routing, 384 experts, and tile width 32, this is about 6 KiB. No extra weight copy is stored.
+
+Set `GGML_CUDA_Q2_K_MOE_COMPACT=0` on both RPC workers to use the original scheduler while retaining the current tile-width setting. This switch is independent of `GGML_CUDA_Q2_K_MOE_NCOLS`; set both to `0` to restore both original choices. A GPU trace shows `mmq_make_expert_tiles` followed by `mul_mat_q2_k_expert_tiles` when compact scheduling runs. End-to-end PP improvement requires measurement; this change does not reduce Q2_K multiplication work.
+
+The existing backend test covers balanced and skewed routing, empty experts, output-row and token tails, broadcast and per-expert activations, and the small-batch boundary:
+
+```sh
+./build/bin/test-backend-ops test -b CUDA0 -o MUL_MAT_ID -p 'type_a=q2_K,.*routing=(balanced|skewed)'
+```
 
 ## Investigating slow prompt processing
 
