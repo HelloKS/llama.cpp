@@ -2051,6 +2051,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
+    // Client UIDs can collide across connections; keep one worker-local UID for each cached graph.
+    graph->uid = uid != 0 ? ggml_graph_next_uid() : 0;
     graph->n_nodes = n_nodes;
     std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
     tensor_ptrs.reserve(n_tensors);

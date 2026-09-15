@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1807,6 +1808,13 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
 
+    struct rpc_graph_ids {
+        uint64_t uid;
+        std::vector<uint64_t> subgraphs;
+    };
+    bool cache_rpc_graph_ids = false;
+    std::vector<rpc_graph_ids> rpc_graph_cache;
+
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
@@ -1827,6 +1835,13 @@ struct ggml_backend_meta_context {
             backend_configs.emplace_back(simple_backends.back(), n_reduce_steps);
         }
         name += ")";
+
+        const char * cache_env = std::getenv("GGML_META_RPC_GRAPH_CACHE");
+        cache_rpc_graph_ids = (!cache_env || std::strcmp(cache_env, "0") != 0) &&
+            std::all_of(simple_backends.begin(), simple_backends.end(), [](ggml_backend_t backend) {
+                auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+                return std::strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
+            });
 
         if (n_devs > 1) {
             ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
@@ -2276,6 +2291,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        ggml_backend_meta_context::rpc_graph_ids * rpc_ids = nullptr;
+        if (backend_ctx->cache_rpc_graph_ids && cgraph->uid != 0) {
+            auto & cache = backend_ctx->rpc_graph_cache;
+            auto it = std::find_if(cache.begin(), cache.end(), [&](const auto & entry) { return entry.uid == cgraph->uid; });
+            if (it != cache.end() && it->subgraphs.size() != n_backends*n_subgraphs) {
+                cache.erase(it);
+                it = cache.end();
+            }
+            if (it == cache.end()) {
+                if (cache.size() == 8) {
+                    cache.erase(cache.begin());
+                }
+                cache.push_back({cgraph->uid, std::vector<uint64_t>(n_backends*n_subgraphs)});
+                for (auto & id : cache.back().subgraphs) {
+                    id = ggml_graph_next_uid();
+                }
+            } else {
+                std::rotate(it, it + 1, cache.end());
+                GGML_LOG_DEBUG("%s: reusing RPC subgraph IDs for graph %" PRIu64 "\n", __func__, cgraph->uid);
+            }
+            rpc_ids = &cache.back();
+        }
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
@@ -2291,7 +2329,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                cgraph_ij->uid = ggml_graph_next_uid();
+                // RPC owns the deserialized tensors, so rotating local tensor containers does not invalidate its graphs.
+                cgraph_ij->uid = rpc_ids ? rpc_ids->subgraphs[j*n_subgraphs + i_graph] : ggml_graph_next_uid();
             }
         }
 

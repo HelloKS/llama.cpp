@@ -170,6 +170,67 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
     ggml_backend_free(draft_backends[0]);
 }
 
+static void test_meta_graph_reuse(ggml_backend_t backend_a, ggml_backend_t backend_b) {
+    ggml_backend_dev_t devices[] = {ggml_backend_get_device(backend_a), ggml_backend_get_device(backend_b)};
+    auto device = ggml_backend_meta_device(devices, 2, [](const ggml_tensor * t, void *) {
+        if (t->op != GGML_OP_NONE) {
+            return ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        return ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_0, {t->ne[0]/2, t->ne[0]/2}, {1}, 1};
+    }, nullptr);
+    auto backend = ggml_backend_dev_init(device, nullptr);
+    GGML_ASSERT(backend);
+
+    ggml_context * contexts[3];
+    ggml_backend_buffer_t buffers[3];
+    ggml_tensor * inputs[3];
+    ggml_tensor * outputs[3];
+    ggml_cgraph * graphs[3];
+    ggml_init_params input_params = {4*ggml_tensor_overhead(), nullptr, true};
+    auto input_ctx = ggml_init(input_params);
+    auto weight = ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, 4, 4);
+    for (int i = 0; i < 3; ++i) {
+        inputs[i] = ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, 4, 4 << i);
+    }
+    auto input_buffer = ggml_backend_alloc_ctx_tensors(input_ctx, backend);
+    GGML_ASSERT(input_buffer);
+    std::vector<float> weights(16, 1.0f);
+    ggml_backend_tensor_set(weight, weights.data(), 0, weights.size()*sizeof(float));
+    for (int i = 0; i < 3; ++i) {
+        ggml_init_params params = {8*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true};
+        contexts[i] = ggml_init(params);
+        auto product = ggml_mul_mat(contexts[i], weight, inputs[i]);
+        outputs[i] = ggml_relu(contexts[i], ggml_scale(contexts[i], product, i + 1.0f));
+        graphs[i] = ggml_new_graph_custom(contexts[i], 8, false);
+        ggml_build_forward_expand(graphs[i], outputs[i]);
+        graphs[i]->uid = ggml_graph_next_uid();
+        buffers[i] = ggml_backend_alloc_ctx_tensors(contexts[i], backend);
+        GGML_ASSERT(buffers[i]);
+        ggml_backend_buffer_set_usage(buffers[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    }
+
+    // Alternate graph shapes and input contents across more than two meta rebuilds.
+    for (int iteration = 0; iteration < 12; ++iteration) {
+        const int i = iteration % 3;
+        std::vector<float> values(ggml_nelements(inputs[i]), iteration - 2.0f);
+        ggml_backend_tensor_set_async(backend, inputs[i], values.data(), 0, values.size()*sizeof(float));
+        GGML_ASSERT(ggml_backend_graph_compute_async(backend, graphs[i]) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, outputs[i], values.data(), 0, values.size()*sizeof(float));
+        ggml_backend_synchronize(backend);
+        const float expected = iteration < 2 ? 0.0f : 4.0f*(iteration - 2)*(i + 1);
+        for (float value : values) {
+            GGML_ASSERT(value == expected);
+        }
+    }
+    ggml_backend_free(backend);
+    for (int i = 0; i < 3; ++i) {
+        ggml_backend_buffer_free(buffers[i]);
+        ggml_free(contexts[i]);
+    }
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
+}
+
 int main(int argc, char ** argv) {
     GGML_ASSERT(argc == 3);
     ggml_backend_load_all();
@@ -209,6 +270,7 @@ int main(int argc, char ** argv) {
     ggml_free(ctx);
     test_allreduce(backend_a, backend_b);
     test_allreduce(backend_a, backend_b);
+    test_meta_graph_reuse(backend_a, backend_b);
     test_deferred_inputs(backend_a, backend_b, false);
     test_deferred_inputs(backend_a, backend_b, true);
     ggml_backend_free(backend_b);
