@@ -1222,7 +1222,7 @@ static bool ggml_cuda_nccl_reduce_rank(void * opaque, ggml_tensor * tensor) {
     while (ticket - state->completed.load() >= state->events.size()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    if (state->fp32 || ne < 32768) {
+    if (state->fp32) {
         std::lock_guard<std::mutex> lock(state->nccl_mutex);
         if (!ggml_cuda_nccl_wait(ncclAllReduce(tensor->data, tensor->data, ne, ncclFloat, ncclSum, state->comm, stream), state->comm)) {
             return false;
@@ -1271,7 +1271,7 @@ static const ggml_backend_nccl_interface * ggml_backend_cuda_get_nccl_interface(
     static const ggml_backend_nccl_interface iface = [] {
         int version = 0;
         ncclGetVersion(&version);
-        return ggml_backend_nccl_interface{2, sizeof(ncclUniqueId), version, ggml_cuda_nccl_get_id,
+        return ggml_backend_nccl_interface{1, sizeof(ncclUniqueId), version, ggml_cuda_nccl_get_id,
             ggml_cuda_nccl_init_rank, ggml_cuda_nccl_reduce_rank, ggml_cuda_nccl_free_rank};
     }();
     return iface.library_version >= 21800 ? &iface : nullptr;

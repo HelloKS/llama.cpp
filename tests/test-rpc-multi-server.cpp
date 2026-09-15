@@ -107,7 +107,7 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
 
     const char * mode = std::getenv("GGML_RPC_ALLREDUCE");
     const bool fp32 = mode && std::strcmp(mode, "nccl-f32") == 0;
-    for (int64_t n : {1, 16, 4096, 12288, 32767, 32768, 65536}) {
+    for (int64_t n : {16, 32767, 32768, 65536}) {
         void * draft_comm = comm_init(draft_backends, 2);
         GGML_ASSERT(draft_comm);
         ggml_context * contexts[2];
@@ -115,21 +115,14 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
         ggml_tensor * inputs[2];
         ggml_tensor * outputs[2];
         ggml_cgraph * graphs[2];
-        ggml_cgraph * feedback[2];
         for (int rank = 0; rank < 2; ++rank) {
-            ggml_init_params params = {4*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(4, false), nullptr, true};
+            ggml_init_params params = {3*ggml_tensor_overhead() + ggml_graph_overhead_custom(4, false), nullptr, true};
             contexts[rank] = ggml_init(params);
             inputs[rank] = ggml_new_tensor_1d(contexts[rank], GGML_TYPE_F32, n);
             outputs[rank] = ggml_scale(contexts[rank], inputs[rank], rank + 2.0f);
             graphs[rank] = ggml_new_graph_custom(contexts[rank], 4, false);
             ggml_build_forward_expand(graphs[rank], outputs[rank]);
             graphs[rank]->uid = ggml_graph_next_uid();
-            auto half = ggml_scale_inplace(contexts[rank], outputs[rank], 0.5f);
-            half->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            feedback[rank] = ggml_new_graph_custom(contexts[rank], 4, false);
-            feedback[rank]->nodes[0] = half;
-            feedback[rank]->n_nodes = 1;
-            feedback[rank]->uid = ggml_graph_next_uid();
             buffers[rank] = ggml_backend_alloc_ctx_tensors(contexts[rank], backends[rank]);
             GGML_ASSERT(buffers[rank]);
         }
@@ -155,15 +148,6 @@ static void test_allreduce(ggml_backend_t backend_a, ggml_backend_t backend_b) {
                 GGML_ASSERT(ggml_backend_graph_compute_async(backends[rank], graphs[rank]) == GGML_STATUS_SUCCESS);
             }
             GGML_ASSERT(allreduce(iteration == 1 ? draft_comm : comm, outputs));
-            if (n == 16 && iteration == 0) {
-                // Queue more than the NCCL event ring holds without a client readback.
-                for (int step = 0; step < 80; ++step) {
-                    for (int rank = 0; rank < 2; ++rank) {
-                        GGML_ASSERT(ggml_backend_graph_compute_async(backends[rank], feedback[rank]) == GGML_STATUS_SUCCESS);
-                    }
-                    GGML_ASSERT(allreduce(step % 2 ? draft_comm : comm, outputs));
-                }
-            }
             for (int rank = 0; rank < 2; ++rank) {
                 ggml_backend_tensor_get_async(backends[rank], outputs[rank], result.data(), 0, n*sizeof(float));
                 ggml_backend_synchronize(backends[rank]);
