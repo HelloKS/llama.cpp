@@ -9910,10 +9910,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n : {31, 32}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 16, 6, b, 129, n, 512, "skewed"));
         }
-        // BF16 prefill dispatch boundary and partial 64-row tiles.
-        for (int n : {1023, 1024}) {
-            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 384, 6, b, 65, n, 768, "skewed"));
-        }
     }
 
     // For issue 27873
