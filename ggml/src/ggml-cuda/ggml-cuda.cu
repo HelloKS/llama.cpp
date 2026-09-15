@@ -3376,6 +3376,29 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+static bool ggml_cuda_match_moe_down_reduction(const ggml_cgraph * cgraph, int node_idx, int cc,
+        ggml_cuda_moe_weighted_reduction_match & match) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_Q2_K_MOE_DOWN_FUSION");
+        return value && std::atoi(value) == 1;
+    }();
+    if (!enabled || node_idx + 1 >= cgraph->n_nodes || !ggml_cuda_can_fuse_moe_down(cgraph->nodes[node_idx], cc) ||
+            !ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, match) || match.experts != cgraph->nodes[node_idx]) {
+        return false;
+    }
+    const int count = match.node_count + 1;
+    std::vector<ggml_op> ops(count);
+    for (int i = 0; i < count; ++i) {
+        ops[i] = cgraph->nodes[node_idx + i]->op;
+    }
+    const int output_idx = node_idx + count - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops.data(), &output_idx, 1)) {
+        return false;
+    }
+    match.node_count = count;
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3636,6 +3659,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (ggml_cuda_match_moe_down_reduction(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                ggml_cuda_moe_down_reduce(*cuda_ctx, node, match.expert_scale, match.weights, match.dst);
+                static std::once_flag logged;
+                std::call_once(logged, [] { GGML_LOG_INFO("CUDA: Q2_K MoE down projection and expert reduction fused\n"); });
+                return match.node_count - 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4708,6 +4744,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_moe_weighted_reduction_match down_match;
+            if (ggml_cuda_match_moe_down_reduction(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc, down_match)) {
+                for (int s = 0; s < 3; ++s) {
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[s], down_match.dst);
+                }
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(down_match.weights), down_match.dst);
+                if (down_match.expert_scale) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(down_match.expert_scale), down_match.dst);
+                }
+                i += down_match.node_count - 1;
+                continue;
+            }
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;
             }
