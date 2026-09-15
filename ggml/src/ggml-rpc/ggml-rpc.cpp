@@ -263,7 +263,7 @@ struct rpc_msg_nccl_init_req {
     uint32_t device;
     uint32_t rank;
     uint32_t world;
-    uint32_t fp32;
+    uint32_t flags; // bit 0: F32 large reductions; bit 1: NCCL small reductions (interface v2)
     uint32_t id_size;
     uint8_t id[256];
 };
@@ -1449,6 +1449,7 @@ private:
     struct nccl_handle {
         const ggml_backend_nccl_interface * api;
         void * context;
+        bool small;
         bool abort = true;
         ~nccl_handle() { api->free(context, abort); }
     };
@@ -2303,7 +2304,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (nbytes == 0) {
         return true;
     }
-    if (state.nccl && t_dst->type == GGML_TYPE_F32 && ne >= 32768) {
+    if (state.nccl && t_dst->type == GGML_TYPE_F32 && (ne >= 32768 || state.nccl->small)) {
         // A failed enqueue must terminate the connection, never replay the reduction.
         return state.nccl->api->reduce(state.nccl->context, t_dst);
     }
@@ -2418,7 +2419,7 @@ bool rpc_server::nccl_info(const rpc_msg_nccl_info_req & request, rpc_msg_nccl_i
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[request.device]));
     auto get = (ggml_backend_get_nccl_interface_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_nccl_interface");
     const auto * api = get ? get() : nullptr;
-    if (!api || api->version != 1 || api->id_size > sizeof(response.id)) {
+    if (!api || (api->version != 1 && api->version != 2) || api->id_size > sizeof(response.id)) {
         return true;
     }
     if (request.generate_id && !api->get_id(response.id)) {
@@ -2432,9 +2433,11 @@ bool rpc_server::nccl_info(const rpc_msg_nccl_info_req & request, rpc_msg_nccl_i
 
 bool rpc_server::nccl_init(const rpc_msg_nccl_init_req & request, rpc_msg_comm_init_rsp & response) {
     response.ok = 0;
-    if (request.device >= backends.size() || request.id_size > sizeof(request.id) || request.fp32 > 1) {
+    if (request.device >= backends.size() || request.id_size > sizeof(request.id) || request.flags > 3) {
         return false;
     }
+    const bool fp32 = (request.flags & 1) != 0;
+    const bool small = (request.flags & 2) != 0;
     auto & state = comm_states[request.device];
     if (!state.peer || state.nccl || state.rank != request.rank || state.world != request.world) {
         return false;
@@ -2443,15 +2446,15 @@ bool rpc_server::nccl_init(const rpc_msg_nccl_init_req & request, rpc_msg_comm_i
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     auto get = (ggml_backend_get_nccl_interface_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_nccl_interface");
     const auto * api = get ? get() : nullptr;
-    if (!api || api->version != 1 || api->id_size != request.id_size) {
+    if (!api || (api->version != 1 && api->version != 2) || (small && api->version < 2) || api->id_size != request.id_size) {
         return true;
     }
-    void * context = api->init_rank(backend, request.id, request.id_size, request.rank, request.world, request.fp32 != 0);
+    void * context = api->init_rank(backend, request.id, request.id_size, request.rank, request.world, fp32);
     if (context) {
-        state.nccl = std::shared_ptr<nccl_handle>(new nccl_handle{api, context});
+        state.nccl = std::shared_ptr<nccl_handle>(new nccl_handle{api, context, small});
         response.ok = 1;
-        GGML_LOG_INFO("%s: rank %u NCCL %d ready (%s, large reductions only)\n", __func__, request.rank,
-            api->library_version, request.fp32 ? "fp32 allreduce" : "bf16 exchange");
+        GGML_LOG_INFO("%s: rank %u NCCL %d ready (large: %s; small: %s)\n", __func__, request.rank,
+            api->library_version, fp32 ? "fp32 allreduce" : "bf16 exchange", small ? "fp32 allreduce" : "pairwise");
     }
     return true;
 }
@@ -3093,7 +3096,7 @@ static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
     delete comm_ctx;
 }
 
-static bool ggml_backend_rpc_nccl_init(const std::vector<ggml_backend_rpc_comm_context::rank_info> & ranks, bool fp32) {
+static bool ggml_backend_rpc_nccl_init(const std::vector<ggml_backend_rpc_comm_context::rank_info> & ranks, bool fp32, bool small) {
     std::vector<rpc_msg_nccl_info_rsp> info(ranks.size());
     for (size_t i = 0; i < ranks.size(); i++) {
         auto request = std::make_shared<rpc_msg_nccl_info_req>();
@@ -3105,9 +3108,11 @@ static bool ggml_backend_rpc_nccl_init(const std::vector<ggml_backend_rpc_comm_c
         rank.dispatcher->synchronize();
     }
     for (const auto & rank_info : info) {
-        if (rank_info.version != 1 || rank_info.id_size == 0 || rank_info.id_size > sizeof(rank_info.id) ||
+        if ((rank_info.version != 1 && rank_info.version != 2) || (small && rank_info.version < 2) ||
+            rank_info.id_size == 0 || rank_info.id_size > sizeof(rank_info.id) ||
             rank_info.id_size != info[0].id_size || rank_info.library_version != info[0].library_version) {
-            GGML_LOG_WARN("%s: both workers need matching NCCL >= 2.18 support\n", __func__);
+            GGML_LOG_WARN("%s: both workers need matching NCCL >= 2.18 support%s\n", __func__,
+                small ? " and NCCL interface v2 for nccl-decode (rebuild both workers)" : "");
             return false;
         }
     }
@@ -3117,7 +3122,7 @@ static bool ggml_backend_rpc_nccl_init(const std::vector<ggml_backend_rpc_comm_c
         request->device = ranks[i].device;
         request->rank = i;
         request->world = ranks.size();
-        request->fp32 = fp32;
+        request->flags = (fp32 ? 1u : 0u) | (small ? 2u : 0u);
         request->id_size = info[0].id_size;
         memcpy(request->id, info[0].id, request->id_size);
         ranks[i].dispatcher->send_async(RPC_CMD_NCCL_INIT, request, sizeof(*request), &responses[i], sizeof(responses[i]));
@@ -3126,8 +3131,9 @@ static bool ggml_backend_rpc_nccl_init(const std::vector<ggml_backend_rpc_comm_c
         rank.dispatcher->synchronize();
     }
     if (std::all_of(responses.begin(), responses.end(), [](const auto & response) { return response.ok != 0; })) {
-        GGML_LOG_INFO("%s: NCCL %u %s enabled for reductions >= 32768 elements; small reductions use pairwise\n",
-            __func__, info[0].library_version, fp32 ? "fp32 allreduce" : "bf16 exchange");
+        GGML_LOG_INFO("%s: NCCL %u %s enabled for reductions >= 32768 elements; small reductions use %s\n",
+            __func__, info[0].library_version, fp32 ? "fp32 allreduce" : "bf16 exchange",
+            small ? "NCCL fp32 allreduce" : "pairwise");
         return true;
     }
     // All ranks must finish cleanup before either can resume the pairwise route.
@@ -3148,11 +3154,11 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     }
     const char * selected = std::getenv("GGML_RPC_ALLREDUCE");
     const std::string mode = selected ? selected : "auto";
-    if (mode != "pairwise" && mode != "auto" && mode != "nccl-exchange" && mode != "nccl-f32") {
+    if (mode != "pairwise" && mode != "auto" && mode != "nccl-exchange" && mode != "nccl-f32" && mode != "nccl-decode") {
         GGML_ABORT("Unknown GGML_RPC_ALLREDUCE value: %s", mode.c_str());
     }
     auto unsupported = [&]() -> void * {
-        if (mode == "nccl-exchange" || mode == "nccl-f32") {
+        if (mode == "nccl-exchange" || mode == "nccl-f32" || mode == "nccl-decode") {
             GGML_ABORT("Requested %s requires two distinct RPC endpoints with matching NCCL support", mode.c_str());
         }
         return nullptr;
@@ -3248,7 +3254,7 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
         return nullptr;
     }
-    if (mode != "pairwise" && !ggml_backend_rpc_nccl_init(ranks, mode == "nccl-f32")) {
+    if (mode != "pairwise" && !ggml_backend_rpc_nccl_init(ranks, mode == "nccl-f32", mode == "nccl-decode")) {
         if (mode != "auto") {
             GGML_ABORT("Requested %s but NCCL initialization failed on the RPC workers", mode.c_str());
         }

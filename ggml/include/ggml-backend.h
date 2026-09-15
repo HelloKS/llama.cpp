@@ -211,6 +211,7 @@ extern "C" {
 
     // Optional NCCL interface for one device per process. Bootstrap data is opaque to RPC.
     struct ggml_backend_nccl_interface {
+        // Version 2 keeps reductions below 32768 elements in F32, including exchange mode.
         uint32_t version;
         size_t id_size;
         int library_version;
