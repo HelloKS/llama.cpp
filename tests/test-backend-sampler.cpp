@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
+#include "../src/models/models.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -2150,7 +2151,7 @@ static ggml_backend_meta_split_state sampling_test_split(const ggml_tensor *, vo
     return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1 };
 }
 
-static void test_tensor_top_k(const std::string & rpc) {
+static ggml_backend_dev_t sampling_test_device(const std::string & rpc) {
     ggml_backend_load_all();
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     GGML_ASSERT(cpu);
@@ -2170,7 +2171,12 @@ static void test_tensor_top_k(const std::string & rpc) {
             devices[i] = ggml_backend_reg_dev_get(reg, 0);
         }
     }
-    auto * device = ggml_backend_meta_device(devices, 2, sampling_test_split, nullptr);
+    return ggml_backend_meta_device(devices, 2, sampling_test_split, nullptr);
+}
+
+static void test_tensor_top_k(const std::string & rpc) {
+    auto * device = sampling_test_device(rpc);
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
     ggml_backend_ptr fallback(ggml_backend_dev_init(cpu, nullptr));
     auto * buft = ggml_backend_dev_buffer_type(device);
@@ -2252,8 +2258,191 @@ static void test_tensor_top_k(const std::string & rpc) {
     fprintf(stderr, "tensor_top_k: mirrored top-k, multi-row output and graph reuse passed\n");
 }
 
+static void test_dspark_head(const std::string & rpc) {
+    auto * device = sampling_test_device(rpc);
+    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+    ggml_backend_ptr cpu(ggml_backend_dev_init(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr));
+    constexpr int vocab = 64;
+    constexpr int rank = 32;
+    constexpr int hidden = 32;
+    const auto set = [](ggml_tensor * tensor, const void * data, size_t bytes) {
+        if (tensor->buffer) {
+            ggml_backend_tensor_set(tensor, data, 0, bytes);
+        }
+    };
+
+    for (ggml_type weight_type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int steps : {1, 3, 5}) {
+            for (bool anchor : {false, true}) {
+                for (int k : {-1, 0, 1, 8, vocab}) {
+                    const int blocks = 2;
+                    const int count = steps * blocks;
+                    llm_graph_result result(2048);
+                    auto * ctx = result.get_ctx();
+                    ggml_context_ptr weights(ggml_init({8 * ggml_tensor_overhead(), nullptr, true}));
+                    llama_model_dflash model(llama_model_default_params());
+                    model.gguf_kv["dflash.block_size"] = "5";
+                    model.gguf_kv["dflash.sample_from_anchor"] = anchor ? "true" : "false";
+                    model.dspark_draft_top_k = k < 0 ? 8 : k;
+                    model.dspark_markov_w1 = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, rank, vocab);
+                    model.dspark_markov_w2 = ggml_new_tensor_2d(weights.get(), weight_type, rank, vocab);
+                    model.dspark_markov_w2_s = ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, 1);
+                    model.dspark_conf_proj = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, hidden + rank, 1);
+                    model.dspark_conf_proj_b = ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, 1);
+                    ggml_backend_buffer_ptr weights_buffer(ggml_backend_alloc_ctx_tensors(weights.get(), backend.get()));
+                    auto * tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, count);
+                    auto * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab, count);
+                    auto * features = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, count);
+                    result.t_logits = base;
+                    result.t_embd = features;
+                    std::vector<ggml_tensor *> inputs = {tokens, base, features};
+                    for (auto * t : inputs) {
+                        ggml_set_input(t);
+                    }
+
+                    llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                    llama_sampler_chain_add(sampler.get(), k < 0 ? llama_sampler_init_top_k(10) : llama_sampler_init_greedy());
+                    GGML_ASSERT(sampler->iface->backend_init(sampler.get(), ggml_backend_dev_buffer_type(device), steps));
+                    llama_seq_id seqs[] = {2, 5};
+                    llama_adapter_loras loras;
+                    llm_graph_params params = {};
+                    params.hparams.n_layer_all = 1;
+                    params.hparams.n_embd = hidden;
+                    params.ubatch.n_tokens = count;
+                    params.ubatch.n_seqs_unq = blocks;
+                    params.ubatch.seq_id_unq = seqs;
+                    params.n_outputs = count;
+                    params.loras = &loras;
+                    params.samplers = {{2, sampler.get()}, {5, sampler.get()}};
+                    params.res = &result;
+                    llm_graph_context graph(params);
+                    llama_model_dflash::build_markov_head(graph, model, tokens);
+                    ggml_tensor * out_tokens = result.t_draft_tokens;
+                    ggml_tensor * out_conf = result.t_draft_confidence;
+                    if (k < 0) {
+                        GGML_ASSERT(result.t_logits && result.t_h_nextn && !out_tokens && !out_conf);
+                        out_tokens = ggml_argmax(ctx, result.t_logits);
+                        out_conf = ggml_cont_1d(ctx, ggml_view_2d(ctx, result.t_h_nextn, 1, count, hidden * sizeof(float), 0), count);
+                        ggml_build_forward_expand(result.get_gf(), out_tokens);
+                        ggml_build_forward_expand(result.get_gf(), out_conf);
+                    } else {
+                        GGML_ASSERT(!result.t_logits && !result.t_h_nextn);
+                        graph.build_sampling();
+                    }
+                    result.set_outputs(params);
+                    ggml_set_output(out_tokens);
+                    ggml_set_output(out_conf);
+                    GGML_ASSERT(ggml_nbytes(out_tokens) == count * sizeof(int32_t));
+                    GGML_ASSERT(ggml_nbytes(out_conf) == count * sizeof(float));
+
+                    ggml_backend_t backends[] = {backend.get(), cpu.get()};
+                    auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 2048, false, false);
+                    for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                        ggml_backend_sched_set_tensor_backend(sched, t, backend.get());
+                    }
+                    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, result.get_gf()));
+                    std::vector<float> w1(rank * vocab), w2(rank * vocab), conf_w(hidden + rank);
+                    for (int i = 0; i < rank * vocab; ++i) {
+                        w1[i] = ((i * 13 + 7) % 29 - 14) * 0.02f;
+                        w2[i] = ((i * 17 + 3) % 31 - 15) * 0.03f;
+                    }
+                    for (int i = 0; i < hidden + rank; ++i) {
+                        conf_w[i] = (i % 7 - 3) * 0.1f;
+                    }
+                    const float scale = 1.25f;
+                    const float conf_bias = -0.3f;
+                    set(model.dspark_markov_w1, w1.data(), w1.size() * sizeof(float));
+                    std::vector<uint8_t> packed(ggml_nbytes(model.dspark_markov_w2));
+                    ggml_quantize_chunk(weight_type, w2.data(), packed.data(), 0, vocab, rank, nullptr);
+                    set(model.dspark_markov_w2, packed.data(), packed.size());
+                    if (weight_type != GGML_TYPE_F32) {
+                        ggml_get_type_traits(weight_type)->to_float(packed.data(), w2.data(), w2.size());
+                    }
+                    set(model.dspark_markov_w2_s, &scale, sizeof(float));
+                    set(model.dspark_conf_proj, conf_w.data(), conf_w.size() * sizeof(float));
+                    set(model.dspark_conf_proj_b, &conf_bias, sizeof(float));
+
+                    for (int replay = 0; replay < 3; ++replay) {
+                        std::vector<int32_t> token_ids(count), actual(count);
+                        std::vector<float> logits(vocab * count), feats(hidden * count), confidence(count);
+                        for (int i = 0; i < count; ++i) {
+                            token_ids[i] = (i * 7 + replay * 11) % vocab;
+                            for (int v = 0; v < vocab; ++v) {
+                                logits[i * vocab + v] = ((v * 19 + i * 7 + replay * 13) % vocab) * 0.07f;
+                            }
+                            for (int h = 0; h < hidden; ++h) {
+                                feats[i * hidden + h] = ((h * 3 + i + replay) % 13 - 6) * 0.04f;
+                            }
+                        }
+                        set(tokens, token_ids.data(), token_ids.size() * sizeof(int32_t));
+                        set(base, logits.data(), logits.size() * sizeof(float));
+                        set(features, feats.data(), feats.size() * sizeof(float));
+                        GGML_ASSERT(ggml_backend_sched_graph_compute(sched, result.get_gf()) == GGML_STATUS_SUCCESS);
+                        ggml_backend_tensor_get(out_tokens, actual.data(), 0, actual.size() * sizeof(int32_t));
+                        ggml_backend_tensor_get(out_conf, confidence.data(), 0, confidence.size() * sizeof(float));
+                        for (int b = 0; b < blocks; ++b) {
+                            int prev = token_ids[b * steps];
+                            for (int i = 0; i < steps; ++i) {
+                                const int row = b * steps + i;
+                                std::vector<int> candidates(vocab);
+                                for (int v = 0; v < vocab; ++v) {
+                                    candidates[v] = v;
+                                }
+                                std::sort(candidates.begin(), candidates.end(), [&](int a, int c) {
+                                    return logits[row * vocab + a] > logits[row * vocab + c];
+                                });
+                                const bool prediction = anchor || i > 0;
+                                if (prediction && k > 0) {
+                                    candidates.resize(k);
+                                }
+                                int expected = -1;
+                                float best = -INFINITY;
+                                for (int v : candidates) {
+                                    float dot = 0;
+                                    for (int r = 0; prediction && r < rank; ++r) {
+                                        dot += w1[prev * rank + r] * w2[v * rank + r];
+                                    }
+                                    const float score = logits[row * vocab + v] + scale * dot;
+                                    if (score > best) {
+                                        best = score;
+                                        expected = v;
+                                    }
+                                }
+                                GGML_ASSERT(actual[row] == expected);
+                                if (prediction) {
+                                    float z = conf_bias;
+                                    for (int h = 0; h < hidden; ++h) {
+                                        z += feats[row * hidden + h] * conf_w[h];
+                                    }
+                                    for (int r = 0; r < rank; ++r) {
+                                        z += w1[prev * rank + r] * conf_w[hidden + r];
+                                    }
+                                    const float expected_conf = 1.0f / (1.0f + std::exp(-z));
+                                    if (std::fabs(confidence[row] - expected_conf) >= 1e-5f) {
+                                        fprintf(stderr, "dspark confidence: steps=%d anchor=%d k=%d replay=%d row=%d got=%f expected=%f\n", steps, anchor, k, replay, row, confidence[row], expected_conf);
+                                    }
+                                    GGML_ASSERT(std::fabs(confidence[row] - expected_conf) < 1e-5f);
+                                    prev = expected;
+                                }
+                            }
+                        }
+                    }
+                    ggml_backend_sched_free(sched);
+                }
+            }
+        }
+    }
+    fprintf(stderr, "dspark_head: compact output, shortlist, dense fallback, quantized weights and replay passed\n");
+}
+
 int main(int argc, char ** argv) {
     test_args args = parse_cli(argc, argv);
+
+    if (args.test == "dspark_head") {
+        llama_backend_init();
+        test_dspark_head(args.rpc);
+        return 0;
+    }
 
     if (args.test == "tensor_top_k") {
         llama_backend_init();
@@ -2261,7 +2450,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (!args.rpc.empty()) {
-        fprintf(stderr, "--rpc is only supported with --test tensor_top_k\n");
+        fprintf(stderr, "--rpc is only supported with --test tensor_top_k or dspark_head\n");
         return EXIT_FAILURE;
     }
 

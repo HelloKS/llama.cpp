@@ -142,7 +142,7 @@ The existing backend test covers balanced and skewed routing, empty experts, out
 
 Tensor mode permits a top-k-only backend sampler for DeepSeek V4/V4.1 and their DFlash/DSpark drafts when the actual output projection has mirrored meta storage. A draft that shares its target's output projection checks that target tensor. Sharded output heads, other sampler chains, and unsupported backend operations retain the CPU fallback.
 
-DSpark already requests a top-10 backend chain. The workers compute the candidate set and return ten I32 token IDs plus ten F32 logits per draft output row (80 bytes of payload) instead of a full vocabulary row. The CPU still sorts the small candidate set and makes the final draft selection. This targets drafting/TG overhead; it does not accelerate the prompt's transformer computation.
+With `LLAMA_DSPARK_COMPACT=0`, DSpark requests a top-10 backend chain. The workers compute the candidate set and return ten I32 token IDs plus ten F32 logits per draft output row (80 bytes of payload) instead of a full vocabulary row. The CPU still sorts the small candidate set and makes the final draft selection. The default compact path is described below.
 
 Rebuild the client and RPC workers. No new option is required when draft backend sampling is enabled. Look for `tensor backend top-k enabled for seq_id=... (replicated output head)` in the client log. Use `--no-spec-draft-backend-sampling` on the client to compare with the CPU sampler, keeping other settings unchanged.
 
@@ -159,6 +159,34 @@ It can also use device 0 from each of two RPC workers:
 ```
 
 CPU meta and two local CPU RPC workers pass this test. CUDA/RDMA execution and the full DSpark workload still require validation on the Sparks.
+
+=======
+### Compact DSpark output and optional Markov shortlist
+
+DSpark uses compact output by default when draft backend sampling is available. It reuses the Markov chain's greedy token IDs and returns one I32 ID and one F32 confidence per position. The whole ID block and the confidence block each use one backend read. This removes the final top-10 selection, vocabulary-logit concatenation, and hidden-width confidence broadcast. It retains the full vocabulary projection and full Markov projection unless shortlisting is enabled.
+
+Set `LLAMA_DSPARK_COMPACT=0` on the client to restore the top-10 path. `--no-spec-draft-backend-sampling` retains the CPU fallback. Tensor mode requires the existing replicated DeepSeek output head. Look for `DSpark compact output enabled` in the client log. Greedy selection uses the same argmax as Markov conditioning; tied logits can select a different candidate than the former CPU top-10 sort.
+
+Set `LLAMA_DSPARK_DRAFT_TOP_K=64` on the client to try a Markov shortlist. This selects the highest base logits at every draft position, gathers only those rows of the Markov output matrix, then computes the sequential bias and selects a token within that set. Packed quantized rows are dequantized only after selection. `0` (default) keeps the full Markov projection. Values must be between zero and the draft vocabulary size. Rebuild the client and workers; no GGUF conversion is needed.
+
+Shortlisting requires compact output, a full draft vocabulary, no active LoRA adapters, and an unsharded Markov output matrix. Other graphs retain the full projection. Log verbosity 4 reports `Markov shortlist enabled` or `unavailable for this graph`. Shortlisting changes draft predictions and can reduce acceptance; target verification still checks every proposed token. Benchmark delivered tokens/s and accepted tokens per cycle, including cold and warm Engram reads. This is not a measured speedup claim.
+
+Compare these client settings with the same model, prompt, sampling, context, and draft length:
+
+| Run | `LLAMA_DSPARK_COMPACT` | `LLAMA_DSPARK_DRAFT_TOP_K` |
+| --- | --- | --- |
+| Previous output path | `0` | `0` |
+| Compact output | `1` | `0` |
+| Compact plus shortlist | `1` | `32`, `64`, `128`, or `256` |
+
+The existing sampler test exercises the production Markov graph with F32, BF16, and Q8_0 weights, scalar confidence, both anchor layouts, multiple sequences, changing inputs on replay, and the dense fallback:
+
+```sh
+./build/bin/test-backend-sampler --test dspark_head
+./build/bin/test-backend-sampler --test dspark_head --rpc SPARK_A_RDMA_IP:50052,SPARK_B_RDMA_IP:50052
+```
+
+Run the RPC test against idle workers. CPU meta and two local CPU RPC workers pass; CUDA/GB10 correctness and end-to-end DSpark throughput still require validation on the Sparks.
 
 ## Investigating slow prompt processing
 

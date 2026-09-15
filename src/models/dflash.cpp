@@ -4,6 +4,9 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cstdlib>
+#include <cstring>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -122,6 +125,15 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
 
         LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
+        if (const char * value = std::getenv("LLAMA_DSPARK_DRAFT_TOP_K")) {
+            char * end = nullptr;
+            const long k = std::strtol(value, &end, 10);
+            if (end == value || *end || k < 0 || k > n_vocab_draft) {
+                throw std::runtime_error("LLAMA_DSPARK_DRAFT_TOP_K must be between 0 and the draft vocabulary size");
+            }
+            dspark_draft_top_k = k;
+            LLAMA_LOG_INFO("%s: DSpark Markov shortlist requested (k=%d)\n", __func__, dspark_draft_top_k);
+        }
     }
 
     const struct ggml_tensor * selector_meta = ml->get_tensor_meta("selector_hidden.weight");
@@ -290,7 +302,7 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+void llama_model_dflash::build_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -323,6 +335,21 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         return;
     }
 
+    bool compact = g.n_outputs == n_tok && !g.samplers.empty();
+    for (uint32_t s = 0; compact && s < g.ubatch.n_seqs_unq; ++s) {
+        const auto it_sampler = g.samplers.find(g.ubatch.seq_id_unq[s]);
+        compact = it_sampler != g.samplers.end() && llama_sampler_chain_n(it_sampler->second) == 1 &&
+            std::strcmp(llama_sampler_name(llama_sampler_chain_get(it_sampler->second, 0)), "+greedy") == 0;
+    }
+
+    const auto split = ggml_backend_meta_tensor_split_axis(w2);
+    const int64_t top_k = compact && !model.d2t && g.loras->empty() &&
+        (split == GGML_BACKEND_SPLIT_AXIS_UNKNOWN || split == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ? model.dspark_draft_top_k : 0;
+    ggml_tensor * shortlist = top_k > 0 ? ggml_top_k(ctx0, base, top_k) : nullptr;
+    if (model.dspark_draft_top_k > 0) {
+        LLAMA_LOG_DEBUG("%s: Markov shortlist %s (k=%d)\n", __func__, shortlist ? "enabled" : "unavailable for this graph", model.dspark_draft_top_k);
+    }
+
     // anchor (committed last) token of every block: token 0 of each block, i.e. a strided view
     const size_t token_stride = (size_t) block_drafts * tokens->nb[0];
     const size_t base_stride = (size_t) block_drafts * base->nb[1];
@@ -332,10 +359,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     ggml_tensor * cat      = nullptr;
     ggml_tensor * cat_conf = nullptr;
+    ggml_tensor * cat_tokens = nullptr;
 
     if (!sample_from_anchor) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
         cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        if (compact) {
+            cat_tokens = ggml_reshape_2d(ctx0, ggml_argmax(ctx0, cat), n_blocks, 1);
+        }
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0)));
         }
@@ -345,7 +376,25 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     //       token pick, not the Markov conditioning path
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
-        ggml_tensor * bias    = g.build_lora_mm(w2, w1_prev, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
+        ggml_tensor * ids = nullptr;
+        ggml_tensor * bias = nullptr;
+        if (shortlist) {
+            ids = ggml_cont(ctx0, ggml_view_2d(ctx0, shortlist, top_k, n_blocks,
+                block_drafts * shortlist->nb[1], i * shortlist->nb[1]));
+            ggml_tensor * rows = ggml_get_rows(ctx0, w2, ggml_reshape_1d(ctx0, ids, top_k * n_blocks));
+            ggml_set_name(rows, "dspark_shortlist_rows");
+            rows = ggml_reshape_3d(ctx0, rows, w2->ne[0], top_k, n_blocks);
+            bias = ggml_mul_mat(ctx0, rows, ggml_reshape_3d(ctx0, w1_prev, w2->ne[0], 1, n_blocks));
+            bias = ggml_reshape_2d(ctx0, bias, top_k, n_blocks);
+            if (model.dspark_markov_w2_s) {
+                bias = ggml_mul(ctx0, bias, model.dspark_markov_w2_s);
+            }
+            base_i = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ggml_cont(ctx0, base_i), 1, n_vocab, n_blocks), ids);
+            base_i = ggml_reshape_2d(ctx0, base_i, top_k, n_blocks);
+        } else {
+            bias = g.build_lora_mm(w2, w1_prev, model.dspark_markov_w2_s);
+        }
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
@@ -356,11 +405,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             bias = ggml_reshape_2d(ctx0, bias, n_vocab, n_blocks);
         }
 
-        // position i of every block: strided view [n_vocab, n_blocks]
-        ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        if (!compact) {
+            cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        }
 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
@@ -378,29 +427,46 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (i + 1 < block_drafts) {
+        if (compact || i + 1 < block_drafts) {
             prev = ggml_argmax(ctx0, col);
+            if (ids) {
+                prev = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids, 1, top_k, n_blocks), ggml_reshape_2d(ctx0, prev, 1, n_blocks));
+                prev = ggml_reshape_1d(ctx0, prev, n_blocks);
+            }
+        }
+        if (compact) {
+            ggml_tensor * selected = ggml_reshape_2d(ctx0, prev, n_blocks, 1);
+            cat_tokens = cat_tokens ? ggml_concat(ctx0, cat_tokens, selected, 1) : selected;
         }
     }
-
-    // cat is position-major; restore ubatch block-major order
-    ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
-    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
-    out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
 
     if (has_conf) {
         ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);
         conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3));
         conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
 
-        // note: broadcast the [1, n_tok] confidences to n_embd-wide rows to be able to reuse `llama_get_embeddings_nextn`
-        conf = ggml_repeat(ctx0, conf, res->t_embd);
-        res->t_h_nextn = conf;
-        ggml_build_forward_expand(g.gf, conf);
+        if (compact) {
+            res->t_draft_confidence = conf;
+            ggml_set_name(conf, "dspark_draft_confidence");
+            ggml_build_forward_expand(g.gf, conf);
+        } else {
+            res->t_h_nextn = ggml_repeat(ctx0, conf, res->t_embd);
+            ggml_build_forward_expand(g.gf, res->t_h_nextn);
+        }
     }
 
-    res->t_logits = out;
-    ggml_build_forward_expand(g.gf, out);
+    if (compact) {
+        res->t_draft_tokens = ggml_cont_1d(ctx0, ggml_transpose(ctx0, cat_tokens), n_tok);
+        ggml_set_name(res->t_draft_tokens, "dspark_draft_tokens");
+        res->t_logits = nullptr;
+        ggml_build_forward_expand(g.gf, res->t_draft_tokens);
+    } else {
+        // Restore ubatch block-major order.
+        ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
+        out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3));
+        res->t_logits = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+        ggml_build_forward_expand(g.gf, res->t_logits);
+    }
 }
 
 static ggml_tensor * build_dflash2_conv(
@@ -818,7 +884,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // DSpark: bias the draft logits with the Markov head
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        build_markov_head(*this, model, inp_tokens);
     }
 
     if (model.dflash_selector_hidden) {
@@ -1014,6 +1080,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, cur);
 
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        build_markov_head(*this, model, inp_tokens);
     }
 }

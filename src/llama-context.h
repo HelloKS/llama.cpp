@@ -87,6 +87,7 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    float get_draft_confidence_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -301,6 +302,7 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+    buffer_view<float> draft_confidence = {nullptr, 0};
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

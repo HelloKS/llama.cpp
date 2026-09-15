@@ -994,6 +994,18 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     return embd_layer_inp[lid].data;
 }
 
+float llama_context::get_draft_confidence_ith(int32_t i) {
+    output_reorder();
+    if (!draft_confidence.has_data()) {
+        return -1.0f;
+    }
+    try {
+        return draft_confidence.data[output_resolve_row(i)];
+    } catch (const std::exception &) {
+        return -1.0f;
+    }
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1229,6 +1241,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
     const bool tensor_sampling = sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    const bool draft_greedy = sampler && model.dspark_markov_w1 && llama_sampler_chain_n(sampler) == 1 &&
+        std::strcmp(llama_sampler_name(llama_sampler_chain_get(sampler, 0)), "greedy") == 0;
     if (tensor_sampling) {
         const bool deepseek_output = model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
             (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0);
@@ -1239,10 +1253,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         const bool top_k_only = llama_sampler_chain_n(sampler) == 1 &&
             std::strcmp(llama_sampler_name(llama_sampler_chain_get(sampler, 0)), "top-k") == 0;
         const bool mirrored_output = ggml_backend_meta_tensor_split_axis(output) == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
-        if (!deepseek_output || !mirrored_output || !top_k_only) {
+        if (!deepseek_output || !mirrored_output || (!top_k_only && !draft_greedy)) {
             static bool warned = false;
             if (!warned) {
-                LLAMA_LOG_WARN("%s: tensor backend sampling requires a replicated DeepSeek V4 output head and a top-k-only chain; using CPU\n", __func__);
+                LLAMA_LOG_WARN("%s: tensor backend sampling requires a replicated DeepSeek V4 output head and top-k or DSpark greedy; using CPU\n", __func__);
                 warned = true;
             }
             if (sampling.samplers.count(seq_id) > 0) {
@@ -1263,8 +1277,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
         const bool initialized = sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
-        if (tensor_sampling && !initialized) {
-            LLAMA_LOG_WARN("%s: tensor backend top-k operations unavailable; using CPU\n", __func__);
+        if ((tensor_sampling || draft_greedy) && !initialized) {
+            LLAMA_LOG_WARN("%s: backend sampling operations unavailable; using CPU\n", __func__);
             if (sampling.samplers.erase(seq_id) > 0) {
                 sched_need_reserve = true;
             }
@@ -1274,7 +1288,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampling.samplers[seq_id] = sampler;
 
         if (tensor_sampling) {
-            LLAMA_LOG_INFO("%s: tensor backend top-k enabled for seq_id=%d (replicated output head)\n", __func__, (int) seq_id);
+            LLAMA_LOG_INFO("%s: tensor backend %s enabled for seq_id=%d (replicated output head)\n", __func__, draft_greedy ? "greedy" : "top-k", (int) seq_id);
         }
 
         sched_need_reserve = true;
@@ -1981,6 +1995,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
+        if (draft_confidence.has_data() && res->t_draft_confidence && n_outputs > 0) {
+            auto * confidence = res->t_draft_confidence;
+            GGML_ASSERT(ggml_nelements(confidence) == n_outputs);
+            GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) draft_confidence.size);
+            auto backend = ggml_backend_sched_get_tensor_backend(sched.get(), confidence);
+            ggml_backend_tensor_get_async(backend, confidence, draft_confidence.data + n_outputs_prev, 0, n_outputs * sizeof(float));
+        }
+
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
         {
@@ -2004,7 +2026,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+            if (res->t_draft_tokens) {
+                auto * tokens = res->t_draft_tokens;
+                GGML_ASSERT(ggml_nelements(tokens) == n_outputs);
+                GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) sampling.sampled.size);
+                auto backend = ggml_backend_sched_get_tensor_backend(sched.get(), tokens);
+                ggml_backend_tensor_get_async(backend, tokens, sampling.sampled.data + n_outputs_prev, 0, n_outputs * sizeof(llama_token));
+            } else {
+                copy_tensor_async_rows(res->t_sampled, sampling.sampled, 1, n_outputs_prev, sched.get());
+            }
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -2102,6 +2132,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    draft_confidence.size = model.dspark_conf_proj ? n_outputs_max : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
@@ -2129,7 +2160,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + embd_nextn.size + draft_confidence.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2147,6 +2178,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
+            draft_confidence.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
             }
@@ -2180,6 +2212,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+
+    draft_confidence.data = draft_confidence.size ? (float *) (base + offset) : nullptr;
+    offset += draft_confidence.size * sizeof(float);
+    if (draft_confidence.has_data()) {
+        std::fill_n(draft_confidence.data, draft_confidence.size, -1.0f);
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -2294,6 +2332,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
+        }
+
+        if (draft_confidence.has_data()) {
+            std::swap(draft_confidence.data[i0], draft_confidence.data[i1]);
         }
 
         if (embd_layer_inp.size() > 0) {
@@ -3996,6 +4038,11 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
+}
+
+float llama_get_draft_confidence_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_draft_confidence_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {

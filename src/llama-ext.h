@@ -104,6 +104,9 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
+// DSpark acceptance confidence, indexed like sampled tokens. Returns -1 if unavailable.
+LLAMA_API float llama_get_draft_confidence_ith(struct llama_context * ctx, int32_t i);
+
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 

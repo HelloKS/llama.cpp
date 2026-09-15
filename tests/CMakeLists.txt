@@ -319,6 +319,7 @@ endif()
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+target_include_directories(test-backend-sampler PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
