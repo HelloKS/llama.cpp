@@ -160,16 +160,6 @@ It can also use device 0 from each of two RPC workers:
 
 CPU meta and two local CPU RPC workers pass this test. CUDA/RDMA execution and the full DSpark workload still require validation on the Sparks.
 
-### Experimental Q2_K decode down-projection fusion
-
-Set `GGML_CUDA_Q2_K_MOE_DOWN_FUSION=1` on both RPC workers to fuse the Q2_K down projection with router weighting and expert summation. Rebuild both workers first. The path is off by default and applies only on SM12x with 1-4 tokens, 2-8 selected experts, contiguous Q2_K weights, and a supported graph pattern. Other shapes keep the existing kernels. Remove the variable or set it to `0` to disable it.
-
-The first successful dispatch prints `CUDA: Q2_K MoE down projection and expert reduction fused`. An enabled variable alone does not establish that a model's graph matched. `GGML_CUDA_DISABLE_FUSION=1` also disables this path.
-
-The kernel retains Q8_1 activation packing and the existing Q2_K vector dot product. Each warp computes one expert's contribution for two output rows, then the block sums weighted contributions in expert order. It replaces the separate down-projection and weighted-reduction launches with one launch, without floating-point atomics or expanded weight copies. It uses 64 bytes of shared memory per block and the same size activation-packing buffer as the original down projection. Buffer lifetime dependencies keep activations, IDs, scales, and routing weights live until the fused output is written. Intermediate down-projection outputs with other consumers cannot be elided.
-
-After rebuilding `test-backend-ops`, run `GGML_CUDA_Q2_K_MOE_DOWN_FUSION=1 build/bin/test-backend-ops test -b CUDA0 -o MOE_DOWN_REDUCTION` on each Spark before the serving benchmark. The cases cover decode batch sizes, row tails, optional scales, and unsupported-shape fallbacks. Local CPU graph tests and host checks of the extracted matcher and kernel indexing pass; these do not validate CUDA compilation, GPU numerical results, or GB10 speed. Keep DSpark and the serving configuration fixed for the comparison. The NCCL decode experiment is not required.
-
 ## Investigating slow prompt processing
 
 Throughput alone does not distinguish GPU kernels, CPU work, page faults, or RPC waits. The CPU compute-buffer size also does not show how much time runs on the CPU. Collect the following with no other inference requests running.

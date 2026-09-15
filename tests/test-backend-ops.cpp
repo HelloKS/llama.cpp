@@ -6657,48 +6657,28 @@ struct test_moe_weighted_reduction : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
-    const bool with_down;
 
     test_moe_weighted_reduction(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false, bool with_down = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds), with_down(with_down) {}
+        interleaved_views_adds(interleaved_views_adds) {}
 
     std::string vars() override {
-        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds, with_down);
+        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
     }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return with_down ? "MOE_DOWN_REDUCTION" : "MOE_WEIGHTED_REDUCTION";
+        return "MOE_WEIGHTED_REDUCTION";
     }
 
     bool run_whole_graph() override { return true; }
 
-    double max_nmse_err() override { return with_down ? 5e-4 : test_case::max_nmse_err(); }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        if (with_down) {
-            init_mul_mat_id_tensors(ctx, 16, "balanced");
-        } else {
-            test_case::initialize_tensors(ctx);
-        }
-    }
-
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * experts;
-        if (with_down) {
-            auto down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_K, 512, n_embd, 16);
-            auto input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 512, n_expert_used, n_tokens);
-            auto ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
-            experts = ggml_mul_mat_id(ctx, down, input, ids);
-            // Finish routing inputs before the down projection to match model graphs.
-            if (mode == MODE_TEST) {
-                ggml_build_forward_expand(gf, experts);
-            }
-        } else if (unaligned_experts) {
+        if (unaligned_experts) {
             ggml_tensor * storage = ggml_new_tensor_1d(
                 ctx, GGML_TYPE_F32, n_embd * n_expert_used * n_tokens + 1);
             ggml_set_name(storage, "experts_storage");
@@ -10738,14 +10718,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
-    for (int tokens : {1, 3, 4, 5}) {
-        for (bool scale : {false, true}) {
-            test_cases.emplace_back(new test_moe_weighted_reduction(63, 6, tokens, false, scale, false, true));
-        }
-    }
-    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 6, 4, false, false, false, true));
-    test_cases.emplace_back(new test_moe_weighted_reduction(129, 8, 3, false, true, true, true));
-    test_cases.emplace_back(new test_moe_weighted_reduction(63, 9, 3, false, false, false, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
