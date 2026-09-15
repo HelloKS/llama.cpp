@@ -138,6 +138,24 @@ The existing backend test covers balanced and skewed routing, empty experts, out
 ./build/bin/test-backend-ops test -b CUDA0 -o MUL_MAT_ID -p 'type_a=q2_K,.*routing=(balanced|skewed)'
 ```
 
+### GB10 Q2_K BF16 prefill POC
+
+Set `GGML_CUDA_Q2_K_MOE_BF16=1` on both rebuilt RPC workers to select an alternative SM12x prefill kernel. This is opt-in; unset it or set `0` to return to the current Q2_K/Q8_1 path. Keep DSpark, batch, context, and other optimization settings unchanged for comparison.
+
+The kernel dequantizes 64 output rows of Q2_K weights into BF16 shared memory and reuses them across up to 32 routed tokens. It reads the original F32 activations into BF16 shared tiles, skips Q8 activation packing, and accumulates with BF16 tensor-core instructions into F32. Weight scales and minimum corrections are applied during dequantization. No full BF16 weight copy or global BF16 activation buffer is allocated. Each block uses 51,072 bytes of shared memory, plus the compact scheduler's small global work list.
+
+Selection requires SM12x hardware, compiled Ampere-or-newer device code, sufficient shared memory, at least 32 tokens, and at least 16 routed tokens per expert on average. For 384 experts and top-6 routing, the last condition requires at least 1024 tokens in the actual microbatch. Short CED replay tails and small TG batches retain the current path. The POC uses fixed 64x32x256 tiles and its own compact queue regardless of the tile-width and compact-scheduler overrides described above.
+
+On the first eligible execution, each worker prints `using Q2_K BF16 prefill (64x32x256 tiles, ... blocks/SM)`. The GPU kernel is named `mul_mat_q2_k_bf16_expert_tiles`. This is a different arithmetic path: BF16 rounding replaces Q8 activation quantization, so results are not bitwise identical. Speed and numerical correctness must be checked on CUDA; CPU tests and host emulation do not validate the GPU instructions or performance.
+
+Run the existing routing tests with the alternative enabled before benchmarking the server:
+
+```sh
+GGML_CUDA_Q2_K_MOE_BF16=1 ./build/bin/test-backend-ops test -b CUDA0 -o MUL_MAT_ID -p 'type_a=q2_K,.*routing=(balanced|skewed)'
+```
+
+These cases include the 1023/1024-token dispatch boundary, partial 64-row tiles, multiple Q2_K blocks along the reduction dimension, and both broadcast and per-expert activations. The original error tolerance is unchanged.
+
 ## Investigating slow prompt processing
 
 Throughput alone does not distinguish GPU kernels, CPU work, page faults, or RPC waits. The CPU compute-buffer size also does not show how much time runs on the CPU. Collect the following with no other inference requests running.
