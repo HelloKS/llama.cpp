@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1033,12 +1032,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        const char * compact_env = std::getenv("LLAMA_DSPARK_COMPACT");
-        const bool compact = is_dspark && (!compact_env || std::atoi(compact_env) != 0);
         if (this->params.backend_sampling && !is_dflash2) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, compact ? llama_sampler_init_greedy() : llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1046,9 +1043,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     chain = nullptr;
                 }
                 backend_chains[seq_id] = chain;
-                if (compact && chain) {
-                    SPC_INF("DSpark compact output enabled for seq_id=%d\n", (int) seq_id);
-                }
             }
         }
 
@@ -1284,30 +1278,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = nullptr;
+                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (params.p_min > 0.0f) {
-                        float confidence = llama_get_draft_confidence_ith(ctx_dft, idx);
-                        if (confidence < 0.0f) {
-                            if (!conf) {
-                                conf = llama_get_embeddings_nextn(ctx_dft);
-                            }
-                            confidence = conf ? conf[(size_t) idx * n_embd_dec] : 1.0f;
-                        }
-                        if (confidence < params.p_min) {
-                            break;
-                        }
-                    }
-
-                    const llama_token sampled = llama_get_sampled_token_ith(ctx_dft, idx);
-                    if (sampled != LLAMA_TOKEN_NULL) {
-                        common_sampler_accept(smpl, sampled, true);
-                        result.push_back(sampled);
-                        continue;
+                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                        break;
                     }
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);

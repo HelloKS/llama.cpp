@@ -1327,8 +1327,6 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
-    t_draft_tokens = nullptr;
-    t_draft_confidence = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1402,12 +1400,6 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
-    }
-    if (t_draft_confidence != nullptr) {
-        ggml_set_output(t_draft_confidence);
-    }
-    if (t_draft_tokens != nullptr) {
-        ggml_set_output(t_draft_tokens);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -3799,16 +3791,6 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (res->t_draft_tokens) {
-        GGML_ASSERT(n_outputs == n_tokens && !samplers.empty());
-        res->add_input(std::make_unique<llm_graph_input_sampling>(samplers));
-        res->t_sampled.resize(n_outputs);
-        for (int64_t i = 0; i < n_outputs; ++i) {
-            res->t_sampled[i] = ggml_view_1d(ctx0, res->t_draft_tokens, 1, i * sizeof(int32_t));
-            ggml_build_forward_expand(gf, res->t_sampled[i]);
-        }
-        return;
-    }
     if (samplers.empty() || !res->t_logits) {
         return;
     }
