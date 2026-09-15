@@ -391,6 +391,9 @@ extern "C" {
     };
     GGML_API const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis);
 
+    // Returns UNKNOWN for tensors without meta storage.
+    GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
+
     struct ggml_backend_meta_split_state {
         enum ggml_backend_meta_split_axis axis;
 

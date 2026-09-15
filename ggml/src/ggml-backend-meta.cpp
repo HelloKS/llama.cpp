@@ -1178,6 +1178,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
 
+enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return GGML_BACKEND_SPLIT_AXIS_UNKNOWN;
+    }
+    return ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false).axis;
+}
+
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
     return (void *) 0x1000000000000000; // FIXME

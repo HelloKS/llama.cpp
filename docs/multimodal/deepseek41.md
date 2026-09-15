@@ -138,6 +138,28 @@ The existing backend test covers balanced and skewed routing, empty experts, out
 ./build/bin/test-backend-ops test -b CUDA0 -o MUL_MAT_ID -p 'type_a=q2_K,.*routing=(balanced|skewed)'
 ```
 
+### DSpark backend top-k with tensor splitting
+
+Tensor mode permits a top-k-only backend sampler for DeepSeek V4/V4.1 and their DFlash/DSpark drafts when the actual output projection has mirrored meta storage. A draft that shares its target's output projection checks that target tensor. Sharded output heads, other sampler chains, and unsupported backend operations retain the CPU fallback.
+
+DSpark already requests a top-10 backend chain. The workers compute the candidate set and return ten I32 token IDs plus ten F32 logits per draft output row (80 bytes of payload) instead of a full vocabulary row. The CPU still sorts the small candidate set and makes the final draft selection. This targets drafting/TG overhead; it does not accelerate the prompt's transformer computation.
+
+Rebuild the client and RPC workers. No new option is required when draft backend sampling is enabled. Look for `tensor backend top-k enabled for seq_id=... (replicated output head)` in the client log. Use `--no-spec-draft-backend-sampling` on the client to compare with the CPU sampler, keeping other settings unchanged.
+
+The model-free test executes the real sampler graph on a two-rank CPU meta backend, checks candidate IDs and scores for multiple output rows, and reuses graphs with changing logits:
+
+```sh
+./build/bin/test-backend-sampler --test tensor_top_k
+```
+
+It can also use device 0 from each of two RPC workers:
+
+```sh
+./build/bin/test-backend-sampler --test tensor_top_k --rpc 192.168.100.10:50052,192.168.100.11:50052
+```
+
+CPU meta and two local CPU RPC workers pass this test. CUDA/RDMA execution and the full DSpark workload still require validation on the Sparks.
+
 ## Investigating slow prompt processing
 
 Throughput alone does not distinguish GPU kernels, CPU work, page faults, or RPC waits. The CPU compute-buffer size also does not show how much time runs on the CPU. Collect the following with no other inference requests running.

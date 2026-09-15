@@ -1228,17 +1228,29 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
+    const bool tensor_sampling = sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    if (tensor_sampling) {
+        const bool deepseek_output = model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
+            (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0);
+        const ggml_tensor * output = model.output;
+        if (!output && cparams.ctx_other) {
+            output = llama_get_model(cparams.ctx_other)->output;
         }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+        const bool top_k_only = llama_sampler_chain_n(sampler) == 1 &&
+            std::strcmp(llama_sampler_name(llama_sampler_chain_get(sampler, 0)), "top-k") == 0;
+        const bool mirrored_output = ggml_backend_meta_tensor_split_axis(output) == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        if (!deepseek_output || !mirrored_output || !top_k_only) {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("%s: tensor backend sampling requires a replicated DeepSeek V4 output head and a top-k-only chain; using CPU\n", __func__);
+                warned = true;
+            }
+            if (sampling.samplers.count(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            sampling.samplers.erase(seq_id);
+            return false;
         }
-        sampling.samplers.erase(seq_id);
-        return false;
     }
 
     const bool can_offload =
@@ -1250,9 +1262,20 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        const bool initialized = sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        if (tensor_sampling && !initialized) {
+            LLAMA_LOG_WARN("%s: tensor backend top-k operations unavailable; using CPU\n", __func__);
+            if (sampling.samplers.erase(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            return false;
+        }
 
         sampling.samplers[seq_id] = sampler;
+
+        if (tensor_sampling) {
+            LLAMA_LOG_INFO("%s: tensor backend top-k enabled for seq_id=%d (replicated output head)\n", __func__, (int) seq_id);
+        }
 
         sched_need_reserve = true;
 

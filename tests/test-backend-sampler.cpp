@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
@@ -24,6 +25,7 @@ struct test_args {
     std::string model;
     std::string test;
     std::string device = "auto";
+    std::string rpc;
 };
 
 struct test_params {
@@ -2027,6 +2029,15 @@ static test_args parse_cli(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         const char * arg = argv[i];
 
+        if (std::strcmp(arg, "--rpc") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--rpc expects two comma-separated endpoints for tensor_top_k\n");
+                exit(EXIT_FAILURE);
+            }
+            out.rpc = argv[++i];
+            continue;
+        }
+
         if (std::strcmp(arg, "--test") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--test expects a value\n");
@@ -2135,8 +2146,124 @@ static void run_tests(const std::vector<const backend_test_case *> & tests, cons
     }
 }
 
+static ggml_backend_meta_split_state sampling_test_split(const ggml_tensor *, void *) {
+    return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1 };
+}
+
+static void test_tensor_top_k(const std::string & rpc) {
+    ggml_backend_load_all();
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu);
+    ggml_backend_dev_t devices[] = { cpu, cpu };
+    if (!rpc.empty()) {
+        const size_t comma = rpc.find(',');
+        GGML_ASSERT(comma != std::string::npos && comma > 0 && comma + 1 < rpc.size() && rpc.find(',', comma + 1) == std::string::npos);
+        const std::string endpoints[] = { rpc.substr(0, comma), rpc.substr(comma + 1) };
+        auto * rpc_reg = ggml_backend_reg_by_name("RPC");
+        GGML_ASSERT(rpc_reg);
+        using add_server_t = ggml_backend_reg_t (*)(const char *);
+        auto add_server = (add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+        GGML_ASSERT(add_server);
+        for (int i = 0; i < 2; ++i) {
+            auto * reg = add_server(endpoints[i].c_str());
+            GGML_ASSERT(reg && ggml_backend_reg_dev_count(reg) > 0);
+            devices[i] = ggml_backend_reg_dev_get(reg, 0);
+        }
+    }
+    auto * device = ggml_backend_meta_device(devices, 2, sampling_test_split, nullptr);
+    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+    ggml_backend_ptr fallback(ggml_backend_dev_init(cpu, nullptr));
+    auto * buft = ggml_backend_dev_buffer_type(device);
+    constexpr int n_vocab = 257;
+    constexpr int k = 10;
+
+    for (int n_rows : {1, 3, 4}) {
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(k));
+        GGML_ASSERT(chain->iface->backend_init(chain.get(), buft, n_rows));
+        ggml_init_params init = { 256*ggml_tensor_overhead() + ggml_graph_overhead_custom(256, false), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(init));
+        auto * graph = ggml_new_graph_custom(ctx.get(), 256, false);
+        auto * logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_vocab, n_rows);
+        ggml_set_input(logits);
+        GGML_ASSERT(ggml_backend_meta_tensor_split_axis(logits) == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        auto * padded = ggml_pad(ctx.get(), logits, 0, 1, 0, 0);
+        std::vector<llama_sampler_data> outputs;
+        for (int row = 0; row < n_rows; ++row) {
+            llama_sampler_data data = { ggml_view_1d(ctx.get(), padded, n_vocab, row*padded->nb[1]), nullptr, nullptr, nullptr };
+            chain->iface->backend_apply(chain.get(), ctx.get(), graph, &data);
+            ggml_set_output(data.logits);
+            ggml_set_output(data.candidates);
+            ggml_build_forward_expand(graph, data.logits);
+            ggml_build_forward_expand(graph, data.candidates);
+            outputs.push_back(data);
+        }
+        ggml_backend_t backends[] = { backend.get(), fallback.get() };
+        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 256, false, false);
+        for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+            ggml_backend_sched_set_tensor_backend(sched, tensor, backend.get());
+        }
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        GGML_ASSERT(ggml_backend_meta_tensor_split_axis(logits) == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        for (const auto & data : outputs) {
+            GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched, data.logits) == backend.get());
+            GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched, data.candidates) == backend.get());
+        }
+
+        // Reuse the graph with different winners in every output row.
+        for (int step = 0; step < 5; ++step) {
+            std::vector<float> values(n_vocab*n_rows);
+            for (int row = 0; row < n_rows; ++row) {
+                for (int v = 0; v < n_vocab; ++v) {
+                    values[row*n_vocab + v] = (v*37 + row*17 + step*13) % n_vocab - 128;
+                }
+            }
+            ggml_backend_tensor_set(logits, values.data(), 0, values.size()*sizeof(float));
+            GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+            for (int row = 0; row < n_rows; ++row) {
+                int32_t ids[k];
+                float scores[k];
+                ggml_backend_tensor_get_async(backend.get(), outputs[row].candidates, ids, 0, sizeof(ids));
+                ggml_backend_tensor_get_async(backend.get(), outputs[row].logits, scores, 0, sizeof(scores));
+                ggml_backend_synchronize(backend.get());
+                std::vector<int> expected(n_vocab);
+                for (int v = 0; v < n_vocab; ++v) {
+                    expected[v] = v;
+                }
+                std::sort(expected.begin(), expected.end(), [&](int a, int b) { return values[row*n_vocab + a] > values[row*n_vocab + b]; });
+                std::vector<std::pair<float, int32_t>> returned;
+                for (int i = 0; i < k; ++i) {
+                    returned.emplace_back(scores[i], ids[i]);
+                }
+                // TOP_K returns a candidate set, not a sorted list.
+                std::sort(returned.begin(), returned.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+                for (int i = 0; i < k; ++i) {
+                    if (returned[i].second != expected[i] || returned[i].first != values[row*n_vocab + expected[i]]) {
+                        fprintf(stderr, "tensor_top_k mismatch: rows=%d step=%d row=%d rank=%d got=%d:%f expected=%d:%f\n",
+                                n_rows, step, row, i, returned[i].second, returned[i].first, expected[i], values[row*n_vocab + expected[i]]);
+                    }
+                    GGML_ASSERT(returned[i].second == expected[i]);
+                    GGML_ASSERT(returned[i].first == values[row*n_vocab + expected[i]]);
+                }
+            }
+        }
+        ggml_backend_sched_free(sched);
+    }
+    fprintf(stderr, "tensor_top_k: mirrored top-k, multi-row output and graph reuse passed\n");
+}
+
 int main(int argc, char ** argv) {
     test_args args = parse_cli(argc, argv);
+
+    if (args.test == "tensor_top_k") {
+        llama_backend_init();
+        test_tensor_top_k(args.rpc);
+        return 0;
+    }
+    if (!args.rpc.empty()) {
+        fprintf(stderr, "--rpc is only supported with --test tensor_top_k\n");
+        return EXIT_FAILURE;
+    }
 
     if (args.model.empty()) {
         args.model = common_get_model_or_exit(1, argv);
