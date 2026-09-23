@@ -669,8 +669,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        if (tensor->src[0]->op == GGML_OP_SSM_SCAN && tensor->view_offs == 0) {
-            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        if (tensor->src[0]->op == GGML_OP_SSM_SCAN && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            // Keep state snapshots split by state width, not by sequence or snapshot count.
+            return {tensor->view_offs == 0 ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
         }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
@@ -1106,7 +1107,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
-                            GGML_ASSERT(split_state.ne[j] % div == 0);
+                            if (div == 0 || split_state.ne[j] % div != 0) {
+                                GGML_ABORT("non-integral tensor split: node=%s op=%s axis=%d ne=[%lld,%lld,%lld,%lld] src=%s src_op=%s src_axis=%d src_ne=[%lld,%lld,%lld,%lld] device=%zu numerator=%lld divisor=%lld nr=%u view_offs=%zu",
+                                    tensor->name, ggml_op_name(tensor->op), (int) split_state.axis,
+                                    (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+                                    tensor->src[i]->name, ggml_op_name(tensor->src[i]->op), (int) src_ss[i].axis,
+                                    (long long) tensor->src[i]->ne[0], (long long) tensor->src[i]->ne[1], (long long) tensor->src[i]->ne[2], (long long) tensor->src[i]->ne[3],
+                                    j, (long long) split_state.ne[j], (long long) div, split_state.nr[0], tensor->view_offs);
+                            }
                             split_state.ne[j] /= div;
                         }
                     }
