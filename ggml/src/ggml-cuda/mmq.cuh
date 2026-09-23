@@ -4,6 +4,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
@@ -947,6 +948,73 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 }
 
+template <int J>
+static __global__ void mmq_make_expert_tiles(
+        const int32_t * __restrict__ expert_bounds, uint2 * __restrict__ tiles,
+        int * __restrict__ ntiles, const int nexperts) {
+    __shared__ int count;
+    if (threadIdx.x == 0) {
+        count = 0;
+    }
+    __syncthreads();
+
+    for (int expert = threadIdx.x; expert < nexperts; expert += blockDim.x) {
+        const int begin = expert_bounds[expert];
+        const int end   = expert_bounds[expert + 1];
+        const int n = (end - begin + J - 1) / J;
+        if (n == 0) {
+            continue;
+        }
+        const int offset = atomicAdd(&count, n);
+        for (int j = 0; j < n; ++j) {
+            tiles[offset + j] = make_uint2(expert, begin + j*J);
+        }
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *ntiles = count;
+    }
+}
+
+template <ggml_type type, int J, bool fallback>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+static __global__ void mul_mat_q_expert_tiles(
+        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint2 * __restrict__ tiles,
+        const int * __restrict__ ntiles, float * __restrict__ dst,
+        const uint3 nty, const int nblocks_x, const int nrows_x, const int stride_row_x,
+        const int stride_channel_x, const int ncols_y, const int stride_col_dst) {
+    if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int I = ggml_cuda_mmq_get_I(type, J, fallback);
+    extern __shared__ int ids_dst_shared[];
+    const int64_t nwork = int64_t(*ntiles) * nty.z;
+
+    for (int64_t work = blockIdx.x; work < nwork; work += gridDim.x) {
+        const uint2 index = fast_div_modulo(work, nty);
+        const uint2 tile = tiles[index.x];
+        const int row = index.y*I;
+        const int col = tile.y;
+        const int remaining = expert_bounds[tile.x + 1] - col;
+
+        for (int j = threadIdx.y*blockDim.x + threadIdx.x; j < J; j += blockDim.x*blockDim.y) {
+            ids_dst_shared[j] = j < remaining ? ids_dst[col + j] : 0;
+        }
+        __syncthreads();
+
+        mul_mat_q_process_tile<type, J, fallback, false>
+            (x, tile.x*stride_channel_x + row*stride_row_x,
+             y + col*(sizeof(block_q8_1_mmq)/sizeof(int)), ids_dst_shared, dst + row, nullptr, nullptr,
+             stride_row_x, ncols_y, stride_col_dst, nrows_x - row - 1, remaining - 1, 0, nblocks_x);
+
+        __syncthreads();
+    }
+}
+
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
@@ -1426,6 +1494,43 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    if constexpr (type == GGML_TYPE_Q2_K ||
+                  type == GGML_TYPE_IQ2_XXS ||
+                  type == GGML_TYPE_IQ2_XS) {
+        static const bool compact = [] {
+            const char * env_name = type == GGML_TYPE_Q2_K
+                ? "GGML_CUDA_Q2_K_MOE_COMPACT"
+                : "GGML_CUDA_IQ2_MOE_COMPACT";
+            const char * value = std::getenv(env_name);
+            return !value || std::atoi(value) != 0;
+        }();
+        const int64_t max_tiles = args.ncols_y / J + args.nchannels_y;
+        if (compact && args.ids_dst && args.expert_bounds && args.ncols_max >= 32 &&
+            cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN &&
+            channel_ratio == 1 && args.nsamples_x == 1 && args.nsamples_y == 1 &&
+            max_tiles <= INT_MAX / nty) {
+            ggml_cuda_pool_alloc<uint2> tiles(ctx.pool(id), max_tiles);
+            ggml_cuda_pool_alloc<int> ntiles(ctx.pool(id), 1);
+            CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_expert_tiles<type, J, fallback>), nbytes_shared);
+            static int blocks_per_sm[GGML_CUDA_MAX_DEVICES] = {};
+            if (blocks_per_sm[id] == 0) {
+                CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm[id], mul_mat_q_expert_tiles<type, J, fallback>, config.nthreads, nbytes_shared));
+                GGML_ASSERT(blocks_per_sm[id] > 0);
+            }
+
+            mmq_make_expert_tiles<J><<<1, 128, 0, stream>>>
+                (args.expert_bounds, tiles.get(), ntiles.get(), args.nchannels_y);
+            CUDA_CHECK(cudaGetLastError());
+            mul_mat_q_expert_tiles<type, J, fallback><<<nsm*blocks_per_sm[id], block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, tiles.get(), ntiles.get(), args.dst,
+                 init_fastdiv_values(nty), blocks_per_ne00_fd.z, args.nrows_x, args.stride_row_x,
+                 args.stride_channel_x, args.ncols_y, args.nrows_dst);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
@@ -1482,6 +1587,26 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
+    int64_t ncols_opt = args.ncols_opt;
+
+    if constexpr (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS) {
+        if (args.ids_dst && args.expert_bounds && args.ncols_max >= 32 &&
+            cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN) {
+            static const int moe_ncols = [] {
+                const char * value = std::getenv("GGML_CUDA_IQ2_MOE_NCOLS");
+                if (!value) {
+                    return -1;
+                }
+                const int parsed = std::atoi(value);
+                return parsed == -1 || parsed == 32 || parsed == 64 || parsed == 128 ? parsed : 0;
+            }();
+            if (moe_ncols != 0) {
+                ncols_opt = moe_ncols == -1
+                    ? (args.ncols_y + args.nchannels_y - 1) / args.nchannels_y
+                    : moe_ncols;
+            }
+        }
+    }
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
@@ -1493,7 +1618,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
+        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
