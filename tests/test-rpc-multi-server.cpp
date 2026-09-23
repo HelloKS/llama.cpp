@@ -4,6 +4,45 @@
 #include "ggml-rpc.h"
 #include "ggml.h"
 
+static void test_graph_cache(ggml_backend_t backend, const char * endpoint) {
+    ggml_backend_t peer = ggml_backend_rpc_init(endpoint, 0);
+    GGML_ASSERT(peer != nullptr);
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 2*ggml_tensor_overhead() + ggml_graph_overhead_custom(1, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * output = ggml_scale(ctx, input, 2.0f);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 1, false);
+    ggml_build_forward_expand(graph, output);
+    graph->uid = ggml_graph_next_uid();
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer != nullptr);
+
+    for (int i = 0; i < 4; ++i) {
+        if (i == 2) {
+            // Freeing any buffer invalidates all graphs on this connection.
+            ggml_backend_buffer_t temporary = ggml_backend_alloc_buffer(peer, 64);
+            GGML_ASSERT(temporary != nullptr);
+            ggml_backend_buffer_free(temporary);
+        }
+        const float value = float(i + 1);
+        ggml_backend_tensor_set(input, &value, 0, sizeof(value));
+        GGML_ASSERT(ggml_backend_graph_compute(i % 2 ? peer : backend, graph) == GGML_STATUS_SUCCESS);
+        float result = 0.0f;
+        ggml_backend_tensor_get(output, &result, 0, sizeof(result));
+        GGML_ASSERT(result == 2.0f*value);
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(peer);
+}
+
 int main(int argc, char ** argv) {
     GGML_ASSERT(argc == 3);
     ggml_backend_load_all();
@@ -15,6 +54,8 @@ int main(int argc, char ** argv) {
     ggml_backend_t backend_b = ggml_backend_rpc_init(endpoint_b, 0);
     GGML_ASSERT(backend_a != nullptr);
     GGML_ASSERT(backend_b != nullptr);
+
+    test_graph_cache(backend_a, endpoint_a);
 
     ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() + ggml_graph_overhead_custom(1, false),

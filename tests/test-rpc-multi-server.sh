@@ -35,7 +35,10 @@ pid_b=$!
 wait_for_port "$port_a"
 wait_for_port "$port_b"
 
-"$client" "$endpoint_a" "$endpoint_b"
+if ! "$client" "$endpoint_a" "$endpoint_b"; then
+    cat "$test_dir/server-a.log" "$test_dir/server-b.log"
+    exit 1
+fi
 
 if grep -q "invalid data ptr" "$test_dir/server-b.log"; then
     cat "$test_dir/server-b.log"

@@ -258,8 +258,6 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
-    // uids of graphs cached by the server for this device
-    std::unordered_set<uint64_t> graph_uids;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -486,6 +484,10 @@ public:
 
     ~rpc_dispatcher();
 
+    // Keep cache updates and command submission in the same order.
+    std::mutex graph_mutex;
+    std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+
 private:
     struct rpc_msg {
         rpc_cmd                       cmd;
@@ -681,7 +683,12 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     auto request = std::make_shared<rpc_msg_free_buffer_req>();
     request->remote_ptr = ctx->remote_ptr;
-    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
+    {
+        std::lock_guard<std::mutex> lock(ctx->dispatcher->graph_mutex);
+        ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
+        // The server clears graphs for every device on this connection.
+        ctx->dispatcher->graph_uids.clear();
+    }
     delete ctx;
 }
 
@@ -1149,11 +1156,10 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
-    ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
-    auto & graph_uids = rpc_dev_ctx->graph_uids;
+    std::lock_guard<std::mutex> lock(rpc_ctx->dispatcher->graph_mutex);
+    auto & graph_uids = rpc_ctx->dispatcher->graph_uids[rpc_ctx->device];
     bool reuse = cgraph->uid != 0 && graph_uids.count(cgraph->uid) > 0;
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
@@ -3039,7 +3045,6 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
             /* .device      = */    ind,
             /* .name        = */    dev_name,
             /* .description = */    dev_desc,
-            /* .graph_uids  = */    {},
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {
