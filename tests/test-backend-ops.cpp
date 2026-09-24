@@ -4482,7 +4482,7 @@ struct test_ssm_scan : public test_case {
         if (xbc_overlap) {
             ggml_tensor * xbc = ggml_new_tensor_4d(ctx, type, d_state, n_head, n_seq_tokens, 2 * n_seqs);
             x = ggml_view_4d(ctx, xbc, head_dim, n_head, n_seq_tokens, n_seqs,
-                             xbc->nb[1], xbc->nb[2], xbc->nb[3], xbc->nb[3]);
+                             head_dim * sizeof(float), xbc->nb[2], xbc->nb[3], xbc->nb[3]);
             B = ggml_view_4d(ctx, xbc, d_state, n_group, n_seq_tokens, n_seqs,
                              xbc->nb[1], xbc->nb[2], xbc->nb[3], 0);
             C = ggml_view_4d(ctx, xbc, d_state, n_group, n_seq_tokens, n_seqs,
@@ -4535,9 +4535,11 @@ struct test_ssm_scan_rollback : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K;
+    const bool    xbc_overlap;
+    const bool    weak_decay;
 
     std::string vars() override {
-        return VARS_TO_STR8(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, K);
+        return VARS_TO_STR10(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, K, xbc_overlap, weak_decay);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4550,7 +4552,7 @@ struct test_ssm_scan_rollback : public test_case {
     }
 
     double max_err() override {
-        return 1e-6;
+        return n_seq_tokens > 128 ? 2e-7 : 1e-6;
     }
 
     double err(const float * a, const float * b, size_t n) override {
@@ -4569,43 +4571,91 @@ struct test_ssm_scan_rollback : public test_case {
             int64_t n_group = 2,
             int64_t n_seq_tokens = 8,
             int64_t n_seqs = 2,
-            int64_t K = 3)
+            int64_t K = 3,
+            bool xbc_overlap = false,
+            bool weak_decay = false)
         : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group),
-          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), xbc_overlap(xbc_overlap), weak_decay(weak_decay) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
-        ggml_tensor * x   = ggml_new_tensor_4d(ctx, type, head_dim, n_head,       n_seq_tokens, n_seqs);
         ggml_tensor * dt  = ggml_new_tensor_3d(ctx, type, n_head,   n_seq_tokens, n_seqs);
         ggml_tensor * A   = ggml_new_tensor_2d(ctx, type, 1,        n_head);
-        ggml_tensor * B   = ggml_new_tensor_4d(ctx, type, d_state,  n_group,      n_seq_tokens, n_seqs);
-        ggml_tensor * C   = ggml_new_tensor_4d(ctx, type, d_state,  n_group,      n_seq_tokens, n_seqs);
+        ggml_tensor * x;
+        ggml_tensor * B;
+        ggml_tensor * C;
+
+        if (xbc_overlap) {
+            ggml_tensor * xbc = ggml_new_tensor_4d(ctx, type, d_state, n_head, n_seq_tokens, 2 * n_seqs);
+            x = ggml_view_4d(ctx, xbc, head_dim, n_head, n_seq_tokens, n_seqs,
+                             head_dim * sizeof(float), xbc->nb[2], xbc->nb[3], xbc->nb[3]);
+            B = ggml_view_4d(ctx, xbc, d_state, n_group, n_seq_tokens, n_seqs,
+                             xbc->nb[1], xbc->nb[2], xbc->nb[3], 0);
+            C = ggml_view_4d(ctx, xbc, d_state, n_group, n_seq_tokens, n_seqs,
+                             xbc->nb[1], xbc->nb[2], xbc->nb[3], 2 * xbc->nb[3]);
+        } else {
+            x = ggml_new_tensor_4d(ctx, type, head_dim, n_head, n_seq_tokens, n_seqs);
+            B = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
+            C = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
+        }
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
+        ggml_set_name(ids, "ids");
 
         ggml_tensor * full = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
 
         const int64_t y_elems     = head_dim * n_head * n_seq_tokens * n_seqs;
         const int64_t state_elems = d_state  * head_dim * n_head      * n_seqs;
 
+        ggml_tensor * tail_s = s;
+        ggml_tensor * tail_ids = ids;
+        int64_t tail_offset = 0;
+        const int64_t aligned_tail_offset = n_seq_tokens >= K ? ((n_seq_tokens - K) / 256) * 256 : 0;
+        const bool relative_state_error = n_seq_tokens > 128;
+
+        if (aligned_tail_offset > 0 && n_seq_tokens - aligned_tail_offset <= 128) {
+            tail_offset = aligned_tail_offset;
+
+            ggml_tensor * x_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, x,  head_dim, n_head,  tail_offset, n_seqs, x->nb[1],  x->nb[2],  x->nb[3],  0));
+            ggml_tensor * dt_prefix = ggml_cont(ctx, ggml_view_3d(ctx, dt, n_head,   tail_offset, n_seqs, dt->nb[1], dt->nb[2], 0));
+            ggml_tensor * B_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, B,  d_state,  n_group, tail_offset, n_seqs, B->nb[1],  B->nb[2],  B->nb[3],  0));
+            ggml_tensor * C_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, C,  d_state,  n_group, tail_offset, n_seqs, C->nb[1],  C->nb[2],  C->nb[3],  0));
+            ggml_tensor * prefix = ggml_ssm_scan(ctx, s, x_prefix, dt_prefix, A, B_prefix, C_prefix, ids, /*K=*/1);
+            ggml_tensor * prefix_state = ggml_view_1d(ctx, prefix, state_elems, head_dim*n_head*tail_offset*n_seqs*ggml_element_size(prefix));
+
+            tail_s = ggml_reshape_4d(ctx, prefix_state, d_state, head_dim, n_head, n_seqs);
+            tail_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(tail_ids, "tail_ids");
+        }
+
         ggml_tensor * out = nullptr;
+        ggml_tensor * norm = nullptr;
         for (int64_t slot = 0; slot < K; ++slot) {
             const int64_t prefix_tokens = n_seq_tokens - slot;
+            const int64_t tail_tokens = prefix_tokens - tail_offset;
+            const size_t x_offset = tail_offset * x->nb[2];
+            const size_t dt_offset = tail_offset * dt->nb[1];
+            const size_t B_offset = tail_offset * B->nb[2];
+            const size_t C_offset = tail_offset * C->nb[2];
 
-            ggml_tensor * x_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, x,  head_dim, n_head,  prefix_tokens, n_seqs, x->nb[1],  x->nb[2],  x->nb[3],  0));
-            ggml_tensor * dt_prefix = ggml_cont(ctx, ggml_view_3d(ctx, dt, n_head,   prefix_tokens, n_seqs, dt->nb[1], dt->nb[2], 0));
-            ggml_tensor * B_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, B,  d_state,  n_group, prefix_tokens, n_seqs, B->nb[1],  B->nb[2],  B->nb[3],  0));
-            ggml_tensor * C_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, C,  d_state,  n_group, prefix_tokens, n_seqs, C->nb[1],  C->nb[2],  C->nb[3],  0));
+            ggml_tensor * x_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, x,  head_dim, n_head,  tail_tokens, n_seqs, x->nb[1],  x->nb[2],  x->nb[3],  x_offset));
+            ggml_tensor * dt_prefix = ggml_cont(ctx, ggml_view_3d(ctx, dt, n_head,   tail_tokens, n_seqs, dt->nb[1], dt->nb[2], dt_offset));
+            ggml_tensor * B_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, B,  d_state,  n_group, tail_tokens, n_seqs, B->nb[1],  B->nb[2],  B->nb[3],  B_offset));
+            ggml_tensor * C_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, C,  d_state,  n_group, tail_tokens, n_seqs, C->nb[1],  C->nb[2],  C->nb[3],  C_offset));
 
-            ggml_tensor * prefix = ggml_ssm_scan(ctx, s, x_prefix, dt_prefix, A, B_prefix, C_prefix, ids, /*K=*/1);
+            ggml_tensor * prefix = ggml_ssm_scan(ctx, tail_s, x_prefix, dt_prefix, A, B_prefix, C_prefix, tail_ids, /*K=*/1);
 
             ggml_tensor * full_state   = ggml_view_1d(ctx, full,   state_elems, (y_elems + slot*state_elems)*ggml_element_size(full));
-            ggml_tensor * prefix_state = ggml_view_1d(ctx, prefix, state_elems, (head_dim*n_head*prefix_tokens*n_seqs)*ggml_element_size(prefix));
+            ggml_tensor * prefix_state = ggml_view_1d(ctx, prefix, state_elems, (head_dim*n_head*tail_tokens*n_seqs)*ggml_element_size(prefix));
             ggml_tensor * diff         = ggml_sum(ctx, ggml_sqr(ctx, ggml_sub(ctx, full_state, prefix_state)));
 
             out = out == nullptr ? diff : ggml_add(ctx, out, diff);
+            if (relative_state_error) {
+                ggml_tensor * slot_norm = ggml_sum(ctx, ggml_sqr(ctx, prefix_state));
+                norm = norm == nullptr ? slot_norm : ggml_add(ctx, norm, slot_norm);
+            }
         }
 
-        return out;
+        return relative_state_error ? ggml_div(ctx, out, norm) : out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -4619,13 +4669,15 @@ struct test_ssm_scan_rollback : public test_case {
                     for (int i = 0; i < t->ne[0]; i++) {
                         data[i] = i;
                     }
-                    std::shuffle(data.begin(), data.end(), rng);
+                    if (strcmp(t->name, "tail_ids") != 0) {
+                        std::shuffle(data.begin(), data.end(), rng);
+                    }
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
                 }
             } else if (ggml_is_view_op(t->op)) {
                 continue;
             } else if (t->ne[1] == n_head && t->ne[2] == 1) {
-                init_tensor_uniform(t, -1.0f, -0.5f);
+                init_tensor_uniform(t, weak_decay ? -0.02f : -1.0f, weak_decay ? -0.005f : -0.5f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -9855,9 +9907,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 256, 1)); // Nemotron-9B SSD path
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B SSD multi-chunk (2 aligned chunks)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 80, 8, 300, 2)); // Mamba-2 SSD multi-chunk (partial 2nd chunk, 2 seqs)
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 48, 4, 2, 300, 2, false, /*K=*/1, /*weak_decay=*/true)); // CUDA SSD fused output partial token tiles
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 4, 768, 2, false, /*K=*/1, /*weak_decay=*/true)); // Mamba-2 SSD 3 chunks, grouped heads and 2 seqs
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 4, 2, false, /*K=*/4)); // Mamba-2 rollback snapshots
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, false, /*K=*/3)); // Mamba-2 rollback overflow
     test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, /*K=*/3)); // rollback snapshots match prefix states
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 16, 2, 1, 1027, 3, true, /*K=*/4, /*weak_decay=*/true)); // CUDA SSD 3-chunk prefix + maximum sequential rollback tail
+    test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 128, 16, 2, 1, 384, 3, /*K=*/4, true, true)); // long rollback snapshots share the aligned SSD prefix
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 64, 4)); // Metal SSD one chunk MMA only, no seq tail
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 65, 2)); // SSD one chunk + 1-token sequential tail
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
